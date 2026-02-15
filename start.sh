@@ -68,7 +68,7 @@ start_backend() {
     echo -e "${GREEN}[后端]${NC} 正在启动 FastAPI (端口 9000)..."
     cd "$ROOT_DIR/backend"
     # 激活 conda 环境并启动后端服务
-    source ~/miniconda3/etc/profile.d/conda.sh && conda activate mylearn12 && \
+    source ~/miniconda3/etc/profile.d/conda.sh && conda activate myStockWatcher && \
     python3 -m uvicorn app.main:app --host 0.0.0.0 --port 9000 --reload 2>&1 | log_prefix "后端" "$YELLOW" &
     backend_pid=$!
 }

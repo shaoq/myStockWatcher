@@ -80,4 +80,4 @@ npm run dev
 后端启动后访问 http://localhost:8000/docs 查看自动生成的API文档
 
 ## 开发者
-项目由 Claude Code 辅助开发
+项目由 Claude Code 辅助开发, 3Q

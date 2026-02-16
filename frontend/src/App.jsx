@@ -18,8 +18,10 @@ import {
   FolderOutlined,
   GlobalOutlined,
   DeleteOutlined,
+  BarChartOutlined,
 } from "@ant-design/icons";
 import StockList from "./components/StockList";
+import DailyReport from "./components/DailyReport";
 import { stockApi } from "./services/api";
 import "./App.css";
 
@@ -87,6 +89,11 @@ function App() {
       key: "all",
       icon: <GlobalOutlined />,
       label: "全部股票",
+    },
+    {
+      key: "daily-report",
+      icon: <BarChartOutlined />,
+      label: "每日报告",
     },
     ...groups.map((group) => ({
       key: group.id.toString(),
@@ -156,21 +163,25 @@ function App() {
             />
           </Sider>
           <Content style={{ padding: "24px" }}>
-            <div
-              style={{
-                background: colorBgContainer,
-                minHeight: 280,
-                padding: "0px",
-                borderRadius: borderRadiusLG,
-                overflow: "hidden",
-              }}
-            >
-              <StockList
-                groupId={selectedGroupId === "all" ? null : selectedGroupId}
-                groups={groups}
-                onGroupsChange={loadGroups}
-              />
-            </div>
+            {selectedGroupId === "daily-report" ? (
+              <DailyReport />
+            ) : (
+              <div
+                style={{
+                  background: colorBgContainer,
+                  minHeight: 280,
+                  padding: "0px",
+                  borderRadius: borderRadiusLG,
+                  overflow: "hidden",
+                }}
+              >
+                <StockList
+                  groupId={selectedGroupId === "all" ? null : selectedGroupId}
+                  groups={groups}
+                  onGroupsChange={loadGroups}
+                />
+              </div>
+            )}
           </Content>
         </Layout>
         <Footer style={{ textAlign: "center" }}>

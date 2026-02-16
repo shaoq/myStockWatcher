@@ -1,5 +1,5 @@
 """数据库模型定义"""
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Table
+from sqlalchemy import Column, Integer, String, Float, DateTime, Date, ForeignKey, Table, Text
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from .database import Base
@@ -46,3 +46,22 @@ class Stock(Base):
 
     def __repr__(self):
         return f"<Stock {self.symbol}: {self.name}>"
+
+
+class StockSnapshot(Base):
+    """股票快照模型 - 存储每日指标状态"""
+    __tablename__ = "stock_snapshots"
+
+    id = Column(Integer, primary_key=True, index=True)
+    stock_id = Column(Integer, ForeignKey("stocks.id", ondelete="CASCADE"), nullable=False, comment="关联股票ID")
+    snapshot_date = Column(Date, nullable=False, comment="快照日期")
+    price = Column(Float, nullable=True, comment="当日价格")
+    ma_results = Column(Text, nullable=True, comment="MA指标结果(JSON格式)")
+
+    created_at = Column(DateTime, default=datetime.utcnow, comment="创建时间")
+
+    # 建立与股票的关联
+    stock = relationship("Stock", backref="snapshots")
+
+    def __repr__(self):
+        return f"<StockSnapshot {self.stock_id}:{self.snapshot_date}>"

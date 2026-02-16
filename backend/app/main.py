@@ -1,7 +1,8 @@
 """FastAPI应用主入口"""
 import time
 import uuid
-from fastapi import FastAPI, Depends, HTTPException, status, Request, Response
+from datetime import date
+from fastapi import FastAPI, Depends, HTTPException, status, Request, Response, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session, joinedload
 from typing import List, Optional
@@ -288,3 +289,75 @@ def update_all_prices(db: Session = Depends(get_db)):
 def get_stock_charts(symbol: str):
     """获取股票趋势图 URL 池"""
     return services.get_stock_chart_urls(symbol)
+
+
+# ============ 快照和报告 API ============
+
+@app.post("/snapshots/generate", response_model=schemas.GenerateSnapshotsResponse, tags=["快照管理"])
+def generate_snapshots(db: Session = Depends(get_db)):
+    """生成今日快照（为所有监控的股票保存当前状态）"""
+    created, updated, message = services.generate_daily_snapshots(db, force=True)
+    return schemas.GenerateSnapshotsResponse(
+        message=message,
+        created_count=created,
+        updated_count=updated
+    )
+
+
+@app.get("/snapshots/check-today", response_model=schemas.SnapshotCheckResponse, tags=["快照管理"])
+def check_today_snapshots(db: Session = Depends(get_db)):
+    """检查今日是否有快照"""
+    from datetime import date as date_type
+    today = date_type.today()
+
+    total_stocks = db.query(models.Stock).count()
+    snapshot_count = crud.count_today_snapshots(db, today)
+
+    return schemas.SnapshotCheckResponse(
+        has_snapshots=snapshot_count > 0,
+        snapshot_count=snapshot_count,
+        total_stocks=total_stocks,
+        snapshot_date=today if snapshot_count > 0 else None
+    )
+
+
+@app.get("/snapshots/dates", tags=["快照管理"])
+def get_snapshot_dates(db: Session = Depends(get_db)):
+    """获取所有有快照的日期列表"""
+    from datetime import date as date_type
+
+    dates = crud.get_all_snapshot_dates(db)
+    today = date_type.today()
+
+    # 获取今日的相邻日期
+    adjacent = crud.get_adjacent_snapshot_dates(db, today)
+
+    return {
+        "dates": [d.isoformat() for d in dates],
+        "prev_date": adjacent["prev"].isoformat() if adjacent["prev"] else None,
+        "next_date": adjacent["next"].isoformat() if adjacent["next"] else None
+    }
+
+
+@app.get("/reports/daily", response_model=schemas.DailyReportResponse, tags=["每日报告"])
+def get_daily_report(target_date: Optional[date] = None, db: Session = Depends(get_db)):
+    """获取每日报告（支持指定日期）"""
+    report = services.get_daily_report(db, target_date)
+
+    return schemas.DailyReportResponse(
+        report_date=report["date"],
+        has_yesterday=report["has_yesterday"],
+        summary=schemas.DailyReportSummary(**report["summary"]),
+        newly_reached=[schemas.StockChangeItem(**item) for item in report["newly_reached"]],
+        newly_below=[schemas.StockChangeItem(**item) for item in report["newly_below"]]
+    )
+
+
+@app.get("/reports/trend", response_model=schemas.TrendDataResponse, tags=["每日报告"])
+def get_trend_data(days: int = 7, db: Session = Depends(get_db)):
+    """获取趋势数据（最近 N 天）"""
+    data = services.get_trend_data(db, days)
+
+    return schemas.TrendDataResponse(
+        data=[schemas.TrendDataPoint(**item) for item in data]
+    )

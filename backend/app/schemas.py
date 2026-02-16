@@ -1,6 +1,6 @@
 """Pydantic模式定义,用于API请求和响应验证"""
 from pydantic import BaseModel, Field
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional, List, Dict
 
 
@@ -87,3 +87,86 @@ class PriceUpdateResponse(BaseModel):
     ma_results: Dict[str, MAResult]
     message: str
     is_realtime: bool = Field(False, description="数据是否为实时获取")
+
+
+# ============ 快照相关模式 ============
+
+class StockSnapshotBase(BaseModel):
+    """股票快照基础模式"""
+    stock_id: int = Field(..., description="股票ID")
+    snapshot_date: date = Field(..., description="快照日期")
+    price: Optional[float] = Field(None, description="当日价格")
+    ma_results: Dict[str, MAResult] = Field({}, description="MA指标结果")
+
+
+class StockSnapshotCreate(StockSnapshotBase):
+    """创建快照的请求模式"""
+    pass
+
+
+class StockSnapshotInDB(StockSnapshotBase):
+    """数据库中的快照模式"""
+    id: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# ============ 报告相关模式 ============
+
+class StockChangeItem(BaseModel):
+    """股票变化项"""
+    stock_id: int
+    symbol: str
+    name: str
+    ma_type: str = Field(..., description="发生变化的MA类型")
+    current_price: float
+    ma_price: float
+    price_difference_percent: float
+
+
+class DailyReportSummary(BaseModel):
+    """每日报告摘要"""
+    total_stocks: int = Field(..., description="监控股票总数")
+    reached_count: int = Field(..., description="达标股票数")
+    newly_reached: int = Field(..., description="新增达标数")
+    newly_below: int = Field(..., description="跌破均线数")
+    reached_rate: float = Field(..., description="达标率(%)")
+    reached_rate_change: float = Field(..., description="达标率变化(百分点)")
+
+
+class DailyReportResponse(BaseModel):
+    """每日报告响应"""
+    report_date: date = Field(..., description="报告日期")
+    has_yesterday: bool = Field(..., description="是否有昨日数据")
+    summary: DailyReportSummary
+    newly_reached: List[StockChangeItem] = Field(default_factory=list, description="新增达标的股票")
+    newly_below: List[StockChangeItem] = Field(default_factory=list, description="跌破均线的股票")
+
+
+class TrendDataPoint(BaseModel):
+    """趋势数据点"""
+    date: str = Field(..., description="日期标签")
+    reached_count: int = Field(..., description="达标数")
+    reached_rate: float = Field(..., description="达标率(%)")
+
+
+class TrendDataResponse(BaseModel):
+    """趋势数据响应"""
+    data: List[TrendDataPoint] = Field(default_factory=list, description="趋势数据点列表")
+
+
+class SnapshotCheckResponse(BaseModel):
+    """快照检查响应"""
+    has_snapshots: bool = Field(..., description="今日是否有快照")
+    snapshot_count: int = Field(..., description="快照数量")
+    total_stocks: int = Field(..., description="监控股票总数")
+    snapshot_date: Optional[date] = Field(None, description="快照日期")
+
+
+class GenerateSnapshotsResponse(BaseModel):
+    """生成快照响应"""
+    message: str
+    created_count: int = Field(..., description="新建快照数")
+    updated_count: int = Field(..., description="更新快照数")

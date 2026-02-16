@@ -12,6 +12,43 @@ const apiClient = axios.create({
   },
 });
 
+// 响应拦截器：统一处理 HTTP 错误
+apiClient.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    // 网络错误（无响应）
+    if (!error.response) {
+      const networkError = new Error("网络连接失败，请检查网络");
+      networkError.isNetworkError = true;
+      return Promise.reject(networkError);
+    }
+
+    const { response } = error;
+    const { status, data } = response;
+
+    // 提取错误消息
+    let message;
+    if (data && data.detail) {
+      // 后端返回的 detail 字段
+      message = data.detail;
+    } else if (status >= 500) {
+      message = "服务器错误，请稍后重试";
+    } else if (status >= 400) {
+      message = `请求错误 (${status})`;
+    } else {
+      message = "未知错误";
+    }
+
+    // 构造统一的错误对象
+    const apiError = new Error(message);
+    apiError.status = status;
+    apiError.detail = data?.detail;
+    apiError.response = response;
+
+    return Promise.reject(apiError);
+  },
+);
+
 // 股票API服务
 export const stockApi = {
   // 获取所有股票 (支持搜索)
@@ -109,6 +146,46 @@ export const stockApi = {
   deleteGroup: async (id) => {
     await apiClient.delete(`/groups/${id}`);
     return true;
+  },
+
+  // --- 快照管理 ---
+
+  // 生成今日快照
+  generateSnapshots: async () => {
+    const response = await apiClient.post("/snapshots/generate");
+    return response.data;
+  },
+
+  // 检查今日快照
+  checkTodaySnapshots: async () => {
+    const response = await apiClient.get("/snapshots/check-today");
+    return response.data;
+  },
+
+  // 获取所有快照日期
+  getSnapshotDates: async () => {
+    const response = await apiClient.get("/snapshots/dates");
+    return response.data;
+  },
+
+  // --- 每日报告 ---
+
+  // 获取每日报告（支持指定日期）
+  getDailyReport: async (targetDate = null) => {
+    const params = {};
+    if (targetDate) {
+      params.target_date = targetDate;
+    }
+    const response = await apiClient.get("/reports/daily", { params });
+    return response.data;
+  },
+
+  // 获取趋势数据
+  getTrendData: async (days = 7) => {
+    const response = await apiClient.get("/reports/trend", {
+      params: { days },
+    });
+    return response.data;
   },
 };
 

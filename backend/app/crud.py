@@ -1,7 +1,9 @@
 """数据库CRUD操作"""
+import json
+from datetime import date
 from sqlalchemy.orm import Session
 from . import models, schemas
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 
 def get_stock(db: Session, stock_id: int) -> Optional[models.Stock]:
@@ -166,3 +168,122 @@ def delete_stock(db: Session, stock_id: int) -> bool:
     db.delete(db_stock)
     db.commit()
     return True
+
+
+# --- 快照相关操作 ---
+
+def get_snapshot(db: Session, stock_id: int, snapshot_date: date) -> Optional[models.StockSnapshot]:
+    """获取指定股票在指定日期的快照"""
+    return db.query(models.StockSnapshot).filter(
+        models.StockSnapshot.stock_id == stock_id,
+        models.StockSnapshot.snapshot_date == snapshot_date
+    ).first()
+
+
+def get_snapshots_by_date(db: Session, snapshot_date: date) -> List[models.StockSnapshot]:
+    """获取指定日期的所有快照"""
+    return db.query(models.StockSnapshot).filter(
+        models.StockSnapshot.snapshot_date == snapshot_date
+    ).all()
+
+
+def get_latest_snapshot_date(db: Session) -> Optional[date]:
+    """获取最新的快照日期"""
+    latest = db.query(models.StockSnapshot).order_by(
+        models.StockSnapshot.snapshot_date.desc()
+    ).first()
+    return latest.snapshot_date if latest else None
+
+
+def get_previous_trading_day_snapshots(db: Session, current_date: date) -> List[models.StockSnapshot]:
+    """获取当前日期之前最近一个交易日的快照"""
+    return db.query(models.StockSnapshot).filter(
+        models.StockSnapshot.snapshot_date < current_date
+    ).order_by(models.StockSnapshot.snapshot_date.desc()).limit(100).all()
+
+
+def create_or_update_snapshot(
+    db: Session,
+    stock_id: int,
+    snapshot_date: date,
+    price: float,
+    ma_results: Dict
+) -> models.StockSnapshot:
+    """创建或更新快照（每只股票每天只有一份快照）"""
+    existing = get_snapshot(db, stock_id, snapshot_date)
+
+    ma_results_json = json.dumps(ma_results, ensure_ascii=False)
+
+    if existing:
+        existing.price = price
+        existing.ma_results = ma_results_json
+        db.commit()
+        db.refresh(existing)
+        return existing
+    else:
+        db_snapshot = models.StockSnapshot(
+            stock_id=stock_id,
+            snapshot_date=snapshot_date,
+            price=price,
+            ma_results=ma_results_json
+        )
+        db.add(db_snapshot)
+        db.commit()
+        db.refresh(db_snapshot)
+        return db_snapshot
+
+
+def get_snapshots_for_trend(db: Session, days: int = 7) -> Dict[date, List[models.StockSnapshot]]:
+    """获取最近 N 天的快照数据，按日期分组"""
+    from datetime import timedelta
+
+    end_date = date.today()
+    start_date = end_date - timedelta(days=days + 7)  # 多取几天以包含非交易日
+
+    snapshots = db.query(models.StockSnapshot).filter(
+        models.StockSnapshot.snapshot_date >= start_date,
+        models.StockSnapshot.snapshot_date <= end_date
+    ).order_by(models.StockSnapshot.snapshot_date).all()
+
+    # 按日期分组
+    result = {}
+    for snapshot in snapshots:
+        if snapshot.snapshot_date not in result:
+            result[snapshot.snapshot_date] = []
+        result[snapshot.snapshot_date].append(snapshot)
+
+    return result
+
+
+def count_today_snapshots(db: Session, snapshot_date: date) -> int:
+    """统计今日快照数量"""
+    return db.query(models.StockSnapshot).filter(
+        models.StockSnapshot.snapshot_date == snapshot_date
+    ).count()
+
+
+def get_all_snapshot_dates(db: Session) -> List[date]:
+    """获取所有有快照的日期列表（降序）"""
+    from sqlalchemy import distinct
+    dates = db.query(distinct(models.StockSnapshot.snapshot_date)).order_by(
+        models.StockSnapshot.snapshot_date.desc()
+    ).all()
+    return [d[0] for d in dates]
+
+
+def get_adjacent_snapshot_dates(db: Session, current_date: date) -> Dict[str, Optional[date]]:
+    """获取指定日期的前后相邻快照日期"""
+    # 获取前一个日期
+    prev_snapshot = db.query(models.StockSnapshot).filter(
+        models.StockSnapshot.snapshot_date < current_date
+    ).order_by(models.StockSnapshot.snapshot_date.desc()).first()
+
+    # 获取后一个日期
+    next_snapshot = db.query(models.StockSnapshot).filter(
+        models.StockSnapshot.snapshot_date > current_date
+    ).order_by(models.StockSnapshot.snapshot_date.asc()).first()
+
+    return {
+        "prev": prev_snapshot.snapshot_date if prev_snapshot else None,
+        "next": next_snapshot.snapshot_date if next_snapshot else None
+    }

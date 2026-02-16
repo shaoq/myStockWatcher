@@ -577,3 +577,362 @@ def enrich_stocks_batch(stocks: List[Stock], force_refresh: bool = False, max_wo
     logger.info(f"[批量富化] 处理完成 | 成功: {len(valid_results)}/{len(stocks)} | 总耗时: {batch_elapsed:.0f}ms | 平均: {batch_elapsed/len(stocks):.0f}ms/只")
 
     return valid_results
+
+
+# ============ 快照和报告服务 ============
+
+def generate_daily_snapshots(db, force: bool = False) -> Tuple[int, int, str]:
+    """
+    为所有监控的股票生成今日快照
+
+    Args:
+        db: 数据库会话
+        force: 是否强制刷新（即使已有快照）
+
+    Returns:
+        Tuple[int, int, str]: (新建数量, 更新数量, 消息)
+    """
+    from . import crud
+
+    today = date.today()
+
+    # 获取所有股票
+    stocks = db.query(Stock).all()
+
+    if not stocks:
+        return 0, 0, "没有监控的股票"
+
+    created_count = 0
+    updated_count = 0
+
+    # 使用并发获取所有股票的实时数据
+    enriched_stocks = enrich_stocks_batch(stocks, force_refresh=True)
+
+    for enriched in enriched_stocks:
+        # 构建 ma_results 字典
+        ma_results = {}
+        for ma_type, result in enriched.ma_results.items():
+            ma_results[ma_type] = {
+                "ma_price": result.ma_price,
+                "reached_target": result.reached_target,
+                "price_difference": result.price_difference,
+                "price_difference_percent": result.price_difference_percent
+            }
+
+        # 检查是否已存在快照
+        existing = crud.get_snapshot(db, enriched.id, today)
+
+        if existing:
+            if force:
+                crud.create_or_update_snapshot(
+                    db, enriched.id, today,
+                    enriched.current_price or 0,
+                    ma_results
+                )
+                updated_count += 1
+        else:
+            crud.create_or_update_snapshot(
+                db, enriched.id, today,
+                enriched.current_price or 0,
+                ma_results
+            )
+            created_count += 1
+
+    message = f"已生成 {created_count} 个新快照"
+    if updated_count > 0:
+        message += f"，更新 {updated_count} 个现有快照"
+
+    logger.info(f"[快照生成] {message} | 日期: {today}")
+
+    return created_count, updated_count, message
+
+
+def get_daily_report(db, target_date: date = None) -> Dict:
+    """
+    生成每日报告
+
+    Args:
+        db: 数据库会话
+        target_date: 目标日期，默认为今天
+
+    Returns:
+        Dict: 报告数据
+    """
+    from . import crud
+
+    if target_date is None:
+        target_date = date.today()
+
+    # 获取目标日期快照
+    target_snapshots = crud.get_snapshots_by_date(db, target_date)
+
+    if not target_snapshots:
+        return {
+            "date": target_date,
+            "has_today": False,
+            "has_yesterday": False,
+            "summary": {
+                "total_stocks": 0,
+                "reached_count": 0,
+                "newly_reached": 0,
+                "newly_below": 0,
+                "reached_rate": 0.0,
+                "reached_rate_change": 0.0
+            },
+            "newly_reached": [],
+            "newly_below": []
+        }
+
+    # 获取前一交易日快照
+    yesterday_snapshots = crud.get_previous_trading_day_snapshots(db, target_date)
+
+    # 构建昨日数据索引
+    yesterday_data = {}
+    for snap in yesterday_snapshots:
+        if snap.snapshot_date < target_date:
+            yesterday_data[snap.stock_id] = {
+                "date": snap.snapshot_date,
+                "ma_results": json.loads(snap.ma_results) if snap.ma_results else {}
+            }
+
+    has_yesterday = len(yesterday_data) > 0
+
+    # 获取所有股票信息
+    stocks = {s.id: s for s in db.query(Stock).all()}
+
+    # 统计目标日期数据
+    total_stocks = len(target_snapshots)
+    reached_count = 0
+    newly_reached_list = []
+    newly_below_list = []
+
+    # 昨日达标率
+    yesterday_reached_count = 0
+    yesterday_total = 0
+
+    for snap in target_snapshots:
+        ma_results = json.loads(snap.ma_results) if snap.ma_results else {}
+
+        # 判断是否达标（任一 MA 达标即算达标）
+        is_reached = any(r.get("reached_target", False) for r in ma_results.values())
+        if is_reached:
+            reached_count += 1
+
+        # 对比昨日
+        stock = stocks.get(snap.stock_id)
+        if stock and snap.stock_id in yesterday_data:
+            yesterday_ma = yesterday_data[snap.stock_id]["ma_results"]
+
+            for ma_type, today_result in ma_results.items():
+                today_reached = today_result.get("reached_target", False)
+                yesterday_result = yesterday_ma.get(ma_type, {})
+                yesterday_reached = yesterday_result.get("reached_target", False)
+
+                # 检测变化
+                if today_reached and not yesterday_reached:
+                    # 新增达标
+                    newly_reached_list.append({
+                        "stock_id": snap.stock_id,
+                        "symbol": stock.symbol,
+                        "name": stock.name,
+                        "ma_type": ma_type,
+                        "current_price": snap.price,
+                        "ma_price": today_result.get("ma_price", 0),
+                        "price_difference_percent": today_result.get("price_difference_percent", 0)
+                    })
+                elif not today_reached and yesterday_reached:
+                    # 跌破均线
+                    newly_below_list.append({
+                        "stock_id": snap.stock_id,
+                        "symbol": stock.symbol,
+                        "name": stock.name,
+                        "ma_type": ma_type,
+                        "current_price": snap.price,
+                        "ma_price": today_result.get("ma_price", 0),
+                        "price_difference_percent": today_result.get("price_difference_percent", 0)
+                    })
+
+    # 计算昨日达标率
+    if has_yesterday:
+        for snap_data in yesterday_data.values():
+            yesterday_total += 1
+            if any(r.get("reached_target", False) for r in snap_data["ma_results"].values()):
+                yesterday_reached_count += 1
+
+    # 计算达标率变化
+    today_rate = (reached_count / total_stocks * 100) if total_stocks > 0 else 0
+    yesterday_rate = (yesterday_reached_count / yesterday_total * 100) if yesterday_total > 0 else 0
+    rate_change = today_rate - yesterday_rate if has_yesterday else 0
+
+    return {
+        "date": target_date,
+        "has_today": True,
+        "has_yesterday": has_yesterday,
+        "summary": {
+            "total_stocks": total_stocks,
+            "reached_count": reached_count,
+            "newly_reached": len(newly_reached_list),
+            "newly_below": len(newly_below_list),
+            "reached_rate": round(today_rate, 1),
+            "reached_rate_change": round(rate_change, 1)
+        },
+        "newly_reached": newly_reached_list,
+        "newly_below": newly_below_list
+    }
+
+    if not today_snapshots:
+        return {
+            "date": today,
+            "has_today": False,
+            "has_yesterday": False,
+            "summary": {
+                "total_stocks": 0,
+                "reached_count": 0,
+                "newly_reached": 0,
+                "newly_below": 0,
+                "reached_rate": 0.0,
+                "reached_rate_change": 0.0
+            },
+            "newly_reached": [],
+            "newly_below": []
+        }
+
+    # 获取昨日快照（按日期降序取第一个不是今天的）
+    yesterday_snapshots = crud.get_previous_trading_day_snapshots(db, today)
+
+    # 构建昨日数据索引
+    yesterday_data = {}
+    for snap in yesterday_snapshots:
+        if snap.snapshot_date < today:
+            yesterday_data[snap.stock_id] = {
+                "date": snap.snapshot_date,
+                "ma_results": json.loads(snap.ma_results) if snap.ma_results else {}
+            }
+
+    has_yesterday = len(yesterday_data) > 0
+
+    # 获取所有股票信息
+    stocks = {s.id: s for s in db.query(Stock).all()}
+
+    # 统计今日数据
+    total_stocks = len(today_snapshots)
+    reached_count = 0
+    newly_reached_list = []
+    newly_below_list = []
+
+    # 昨日达标率
+    yesterday_reached_count = 0
+    yesterday_total = 0
+
+    for snap in today_snapshots:
+        ma_results = json.loads(snap.ma_results) if snap.ma_results else {}
+
+        # 判断今日是否达标（任一 MA 达标即算达标）
+        is_reached = any(r.get("reached_target", False) for r in ma_results.values())
+        if is_reached:
+            reached_count += 1
+
+        # 对比昨日
+        stock = stocks.get(snap.stock_id)
+        if stock and snap.stock_id in yesterday_data:
+            yesterday_ma = yesterday_data[snap.stock_id]["ma_results"]
+
+            for ma_type, today_result in ma_results.items():
+                today_reached = today_result.get("reached_target", False)
+                yesterday_result = yesterday_ma.get(ma_type, {})
+                yesterday_reached = yesterday_result.get("reached_target", False)
+
+                # 检测变化
+                if today_reached and not yesterday_reached:
+                    # 新增达标
+                    newly_reached_list.append({
+                        "stock_id": snap.stock_id,
+                        "symbol": stock.symbol,
+                        "name": stock.name,
+                        "ma_type": ma_type,
+                        "current_price": snap.price,
+                        "ma_price": today_result.get("ma_price", 0),
+                        "price_difference_percent": today_result.get("price_difference_percent", 0)
+                    })
+                elif not today_reached and yesterday_reached:
+                    # 跌破均线
+                    newly_below_list.append({
+                        "stock_id": snap.stock_id,
+                        "symbol": stock.symbol,
+                        "name": stock.name,
+                        "ma_type": ma_type,
+                        "current_price": snap.price,
+                        "ma_price": today_result.get("ma_price", 0),
+                        "price_difference_percent": today_result.get("price_difference_percent", 0)
+                    })
+
+    # 计算昨日达标率
+    if has_yesterday:
+        for snap_data in yesterday_data.values():
+            yesterday_total += 1
+            if any(r.get("reached_target", False) for r in snap_data["ma_results"].values()):
+                yesterday_reached_count += 1
+
+    # 计算达标率变化
+    today_rate = (reached_count / total_stocks * 100) if total_stocks > 0 else 0
+    yesterday_rate = (yesterday_reached_count / yesterday_total * 100) if yesterday_total > 0 else 0
+    rate_change = today_rate - yesterday_rate if has_yesterday else 0
+
+    return {
+        "date": today,
+        "has_today": True,
+        "has_yesterday": has_yesterday,
+        "summary": {
+            "total_stocks": total_stocks,
+            "reached_count": reached_count,
+            "newly_reached": len(newly_reached_list),
+            "newly_below": len(newly_below_list),
+            "reached_rate": round(today_rate, 1),
+            "reached_rate_change": round(rate_change, 1)
+        },
+        "newly_reached": newly_reached_list,
+        "newly_below": newly_below_list
+    }
+
+
+def get_trend_data(db, days: int = 7) -> List[Dict]:
+    """
+    获取趋势数据
+
+    Args:
+        db: 数据库会话
+        days: 天数
+
+    Returns:
+        List[Dict]: 趋势数据点列表
+    """
+    from . import crud
+
+    # 获取快照数据
+    snapshots_by_date = crud.get_snapshots_for_trend(db, days)
+
+    if not snapshots_by_date:
+        return []
+
+    # 按日期排序，取最近 N 个交易日
+    sorted_dates = sorted(snapshots_by_date.keys(), reverse=True)[:days]
+    sorted_dates.reverse()  # 从旧到新排列
+
+    trend_data = []
+    for d in sorted_dates:
+        snapshots = snapshots_by_date[d]
+        total = len(snapshots)
+        reached = 0
+
+        for snap in snapshots:
+            ma_results = json.loads(snap.ma_results) if snap.ma_results else {}
+            if any(r.get("reached_target", False) for r in ma_results.values()):
+                reached += 1
+
+        trend_data.append({
+            "date": d.strftime("%m/%d"),
+            "reached_count": reached,
+            "reached_rate": round(reached / total * 100, 1) if total > 0 else 0
+        })
+
+    return trend_data

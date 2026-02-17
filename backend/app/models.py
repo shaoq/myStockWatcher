@@ -65,3 +65,20 @@ class StockSnapshot(Base):
 
     def __repr__(self):
         return f"<StockSnapshot {self.stock_id}:{self.snapshot_date}>"
+
+
+class TradingCalendar(Base):
+    """交易日历缓存模型 - 存储中国A股交易日历"""
+    __tablename__ = "trading_calendar"
+
+    id = Column(Integer, primary_key=True, index=True)
+    trade_date = Column(Date, unique=True, nullable=False, index=True, comment="日期")
+    is_trading_day = Column(Integer, nullable=False, default=0, comment="是否为交易日 (0:否, 1:是)")
+    year = Column(Integer, index=True, comment="年份（用于批量查询缓存）")
+
+    created_at = Column(DateTime, default=datetime.utcnow, comment="创建时间")
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, comment="更新时间")
+
+    def __repr__(self):
+        status = "交易日" if self.is_trading_day else "非交易日"
+        return f"<TradingCalendar {self.trade_date}: {status}>"

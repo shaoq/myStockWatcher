@@ -32,17 +32,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - 股票分组管理（多对多关系）
 - 趋势图 URL 生成
 - 交易时间智能缓存（区分实时/缓存数据）
+- 每日报告生成与历史报告查看
+- 交易日历智能判断（多层数据源保障）
 
 ### 目录结构与核心逻辑
 - **`backend/app/`**:
     - `main.py`: FastAPI 应用入口，定义所有 RESTful API 路由
-    - `models.py`: 数据库模型，`Stock` 和 `Group` 通过多对多关系关联
+    - `models.py`: 数据库模型（`Stock`, `Group`, `StockSnapshot`, `TradingCalendar`）
     - `schemas.py`: Pydantic 模式，负责请求验证和响应序列化
     - `crud.py`: 封装底层数据库 CRUD 操作
-    - `services.py`: 业务逻辑层，通过新浪财经 API 获取实时价格并动态计算均线值
+    - `services.py`: 业务逻辑层，包含交易日历、快照生成、报告计算等
     - `database.py`: 数据库连接配置（SQLite）
 - **`frontend/src/`**:
     - `components/StockList.jsx`: 核心股票管理界面
+    - `components/DailyReport.jsx`: 每日报告页面
     - `services/api.js`: Axios 客户端封装，统一处理后端请求
     - `App.jsx`: 应用主布局与 Ant Design 全局主题配置
 
@@ -60,6 +63,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `POST /stocks/update-all-prices` - 批量刷新所有股票价格
 - `GET /stocks/symbol/{symbol}/charts` - 获取股票趋势图 URL
 - 分组管理端点：`/groups/` 系列接口
+- 交易日历端点：`/trading-calendar/check`, `/trading-calendar/refresh`
+- 快照管理端点：`/snapshots/generate`, `/snapshots/check-today`, `/snapshots/dates`
+- 每日报告端点：`/reports/daily`, `/reports/trend`
 
 ### 数据流向
 1. 用户在前端输入股票代码 → `createStock()` → 后端 `/stocks/`
@@ -132,3 +138,62 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 根据股票代码自动识别市场类型：
 - **A股**: 6/9/0/3/8/4 开头的 6 位数字代码
 - **美股**: 字母代码（如 AAPL, TSLA）
+
+## 每日报告功能
+
+### 功能概述
+每日报告页面展示股票指标变化和趋势，支持查看历史报告和交易日判断。
+
+### 前端实现 (`DailyReport.jsx`)
+
+**主要功能**：
+- 报告概览：监控总数、达标数量、达标率、较昨日变化
+- 状态变化：新增达标 / 跌破均线 股票列表
+- 趋势图表：近 7 日达标趋势可视化
+- 历史报告：日期选择器支持查看历史报告
+- 交易日判断：显示"交易日"或"休市"状态
+
+**日期选择器限制**：
+- 禁用未来日期（只能选择今天及之前的日期）
+- 选择无快照的历史交易日时，弹出确认对话框询问是否生成报告
+
+**关键状态**：
+- `checkingTradingDay`: 交易日检查的 loading 状态
+- `isNonTradingDay`: 是否为非交易日
+- `availableDates`: 有快照的日期列表
+
+## 交易日历功能
+
+### 功能概述
+智能判断指定日期是否为交易日，支持周末和中国节假日判断。
+
+### 数据源架构（3 层保障）
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Layer 1: AkShare（主数据源）                                │
+│  - 节假日数据最准确                                          │
+│  - 支持多种日期格式：2026-01-05 / 20260105 / 2026/01/05     │
+├─────────────────────────────────────────────────────────────┤
+│  Layer 2: exchange_calendars（备用数据源）                   │
+│  - 纯本地计算，无网络依赖                                    │
+│  - 使用上海证券交易所(XSHG)日历                              │
+├─────────────────────────────────────────────────────────────┤
+│  Layer 3: 周末判断（基础兜底）                               │
+│  - 最终保障，确保任何情况都能返回有效判断                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 后端实现 (`services.py`)
+
+**关键函数**：
+- `parse_date_flexible(date_str)`: 灵活的日期解析，支持多种格式
+- `fetch_trading_calendar_from_akshare(year)`: 从 AkShare 获取交易日历
+- `fetch_trading_calendar_from_exchange_calendars(year)`: 备用数据源
+- `get_trading_dates_with_fallback(year)`: 多层数据源 fallback
+- `is_trading_day(db, target_date)`: 判断指定日期是否为交易日
+
+### 数据库模型 (`TradingCalendar`)
+- `trade_date`: 日期
+- `is_trading_day`: 是否为交易日 (0/1)
+- `year`: 年份（用于批量查询缓存）

@@ -150,9 +150,15 @@ export const stockApi = {
 
   // --- 快照管理 ---
 
-  // 生成今日快照
-  generateSnapshots: async () => {
-    const response = await apiClient.post("/snapshots/generate");
+  // 生成快照（支持指定日期）
+  generateSnapshots: async (targetDate = null) => {
+    const params = {};
+    if (targetDate) {
+      params.target_date = targetDate;
+    }
+    const response = await apiClient.post("/snapshots/generate", null, {
+      params,
+    });
     return response.data;
   },
 
@@ -165,6 +171,30 @@ export const stockApi = {
   // 获取所有快照日期
   getSnapshotDates: async () => {
     const response = await apiClient.get("/snapshots/dates");
+    return response.data;
+  },
+
+  // --- 交易日历 ---
+
+  // 检查是否为交易日
+  checkTradingDay: async (targetDate = null) => {
+    const params = {};
+    if (targetDate) {
+      params.target_date = targetDate;
+    }
+    const response = await apiClient.get("/trading-calendar/check", { params });
+    return response.data;
+  },
+
+  // 刷新交易日历缓存
+  refreshTradingCalendar: async (year = null) => {
+    const params = {};
+    if (year) {
+      params.year = year;
+    }
+    const response = await apiClient.post("/trading-calendar/refresh", null, {
+      params,
+    });
     return response.data;
   },
 

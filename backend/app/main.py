@@ -291,12 +291,73 @@ def get_stock_charts(symbol: str):
     return services.get_stock_chart_urls(symbol)
 
 
+# ============ 交易日历 API ============
+
+@app.get("/trading-calendar/check", tags=["交易日历"])
+def check_trading_day(
+    target_date: Optional[date] = Query(None, description="要检查的日期，默认为今天"),
+    db: Session = Depends(get_db)
+):
+    """检查指定日期是否为交易日"""
+    if target_date is None:
+        target_date = date.today()
+
+    is_trading, reason = services.is_trading_day(db, target_date)
+
+    return {
+        "date": target_date.isoformat(),
+        "is_trading_day": is_trading,
+        "reason": reason
+    }
+
+
+@app.post("/trading-calendar/refresh", tags=["交易日历"])
+def refresh_trading_calendar(
+    year: Optional[int] = Query(None, description="要刷新的年份，默认为当前年份"),
+    db: Session = Depends(get_db)
+):
+    """刷新交易日历缓存"""
+    created, message = services.refresh_trading_calendar(db, year)
+
+    return {
+        "success": True,
+        "created_count": created,
+        "message": message
+    }
+
+
 # ============ 快照和报告 API ============
 
 @app.post("/snapshots/generate", response_model=schemas.GenerateSnapshotsResponse, tags=["快照管理"])
-def generate_snapshots(db: Session = Depends(get_db)):
-    """生成今日快照（为所有监控的股票保存当前状态）"""
-    created, updated, message = services.generate_daily_snapshots(db, force=True)
+def generate_snapshots(
+    target_date: Optional[date] = Query(None, description="目标日期，默认为今天"),
+    db: Session = Depends(get_db)
+):
+    """
+    生成快照（为所有监控的股票保存状态）
+
+    - 交易日：使用实时数据生成快照
+    - 历史交易日：使用 K 线收盘价生成快照
+    - 非交易日：返回错误
+    """
+    if target_date is None:
+        target_date = date.today()
+
+    # 检查是否为交易日
+    is_trading, reason = services.is_trading_day(db, target_date)
+
+    if not is_trading:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": f"该日期为非交易日（{reason}）",
+                "is_trading_day": False,
+                "reason": reason,
+                "date": target_date.isoformat()
+            }
+        )
+
+    created, updated, message = services.generate_daily_snapshots(db, force=True, target_date=target_date)
     return schemas.GenerateSnapshotsResponse(
         message=message,
         created_count=created,
@@ -341,7 +402,29 @@ def get_snapshot_dates(db: Session = Depends(get_db)):
 
 @app.get("/reports/daily", response_model=schemas.DailyReportResponse, tags=["每日报告"])
 def get_daily_report(target_date: Optional[date] = None, db: Session = Depends(get_db)):
-    """获取每日报告（支持指定日期）"""
+    """
+    获取每日报告（支持指定日期）
+
+    - 交易日：返回报告数据
+    - 非交易日：返回错误，提示休市
+    """
+    if target_date is None:
+        target_date = date.today()
+
+    # 检查是否为交易日
+    is_trading, reason = services.is_trading_day(db, target_date)
+
+    if not is_trading:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": f"该日期为非交易日（{reason}）",
+                "is_trading_day": False,
+                "reason": reason,
+                "date": target_date.isoformat()
+            }
+        )
+
     report = services.get_daily_report(db, target_date)
 
     return schemas.DailyReportResponse(

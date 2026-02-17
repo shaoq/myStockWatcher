@@ -98,6 +98,373 @@ def is_trading_time(market: str) -> bool:
     return False
 
 
+# ============ 交易日历服务 ============
+
+def parse_date_flexible(date_str) -> Optional[date]:
+    """
+    灵活的日期解析函数，支持多种格式
+
+    支持格式:
+    - "2026-01-05" (带横线)
+    - "20260105" (无分隔符)
+    - "2026/01/05" (带斜杠)
+
+    Args:
+        date_str: 日期字符串或数字
+
+    Returns:
+        Optional[date]: 解析成功的日期对象，失败返回 None
+    """
+    date_str = str(date_str).strip()
+
+    # 支持的日期格式列表
+    formats = ["%Y-%m-%d", "%Y%m%d", "%Y/%m/%d"]
+
+    for fmt in formats:
+        try:
+            return datetime.strptime(date_str, fmt).date()
+        except ValueError:
+            continue
+
+    logger.warning(f"[日期解析] 无法解析日期格式: {date_str}")
+    return None
+
+
+def fetch_trading_calendar_from_akshare(year: int) -> List[date]:
+    """
+    从 AkShare 获取指定年份的交易日历（第1层：主数据源）
+
+    Args:
+        year: 年份
+
+    Returns:
+        List[date]: 交易日列表
+    """
+    try:
+        import akshare as ak
+        logger.info(f"[交易日历-L1] AkShare 开始获取 {year} 年交易日历...")
+
+        # 获取交易日历数据
+        df = ak.tool_trade_date_hist_sina()
+        logger.info(f"[交易日历-L1] AkShare 返回数据条数: {len(df) if df is not None else 0}")
+
+        if df is None or df.empty:
+            logger.warning(f"[交易日历-L1] AkShare 返回空数据")
+            return []
+
+        # 筛选指定年份
+        year_str = str(year)
+        trading_dates = []
+
+        for date_value in df['trade_date'].tolist():
+            date_str = str(date_value)
+            # 检查年份匹配（支持多种格式）
+            if date_str.startswith(year_str) or year_str in date_str:
+                # 使用灵活的日期解析
+                date_obj = parse_date_flexible(date_str)
+                if date_obj and date_obj.year == year:
+                    trading_dates.append(date_obj)
+
+        logger.info(f"[交易日历-L1] AkShare 获取 {year} 年交易日历成功，共 {len(trading_dates)} 个交易日")
+        return trading_dates
+
+    except ImportError as e:
+        logger.error(f"[交易日历-L1] AkShare 库未安装: {e}")
+        return []
+    except Exception as e:
+        logger.error(f"[交易日历-L1] AkShare 获取失败: {type(e).__name__}: {e}")
+        return []
+
+
+def fetch_trading_calendar_from_exchange_calendars(year: int) -> List[date]:
+    """
+    从 exchange_calendars 库获取指定年份的交易日历（第2层：备用数据源）
+
+    使用上海证券交易所(XSHG)日历作为中国A股交易日历
+
+    Args:
+        year: 年份
+
+    Returns:
+        List[date]: 交易日列表
+    """
+    try:
+        import exchange_calendars as xcals
+        logger.info(f"[交易日历-L2] exchange_calendars 开始获取 {year} 年交易日历...")
+
+        # 获取上海证券交易所日历
+        xshg = xcals.get_calendar("XSHG")
+
+        # 获取指定年份的所有交易日
+        start_date = f"{year}-01-01"
+        end_date = f"{year}-12-31"
+
+        schedule = xshg.schedule.loc[start_date:end_date]
+        trading_dates = [idx.date() for idx in schedule.index]
+
+        logger.info(f"[交易日历-L2] exchange_calendars 获取 {year} 年交易日历成功，共 {len(trading_dates)} 个交易日")
+        return trading_dates
+
+    except ImportError as e:
+        logger.warning(f"[交易日历-L2] exchange_calendars 库未安装: {e}")
+        return []
+    except Exception as e:
+        logger.error(f"[交易日历-L2] exchange_calendars 获取失败: {type(e).__name__}: {e}")
+        return []
+
+
+def get_trading_dates_with_fallback(year: int) -> List[date]:
+    """
+    使用多层数据源获取交易日历（带 fallback 机制）
+
+    优先级：
+    1. AkShare（主数据源，节假日最准确）
+    2. exchange_calendars（备用数据源，纯本地计算）
+
+    Args:
+        year: 年份
+
+    Returns:
+        List[date]: 交易日列表
+    """
+    # 第1层：AkShare
+    trading_dates = fetch_trading_calendar_from_akshare(year)
+    if trading_dates:
+        return trading_dates
+
+    logger.warning(f"[交易日历] AkShare 获取失败，尝试备用数据源...")
+
+    # 第2层：exchange_calendars
+    trading_dates = fetch_trading_calendar_from_exchange_calendars(year)
+    if trading_dates:
+        return trading_dates
+
+    logger.error(f"[交易日历] 所有数据源均获取失败，{year} 年交易日历将为空")
+    return []
+
+
+def refresh_trading_calendar(db, year: int = None) -> Tuple[int, str]:
+    """
+    刷新交易日历缓存
+
+    Args:
+        db: 数据库会话
+        year: 年份，默认为当前年份
+
+    Returns:
+        Tuple[int, str]: (新增记录数, 消息)
+    """
+    from . import crud
+
+    if year is None:
+        year = date.today().year
+
+    # 删除旧缓存
+    deleted = crud.delete_trading_calendar_by_year(db, year)
+    logger.info(f"[交易日历] 删除 {year} 年旧缓存: {deleted} 条")
+
+    # 使用多层数据源获取交易日历
+    trading_dates = get_trading_dates_with_fallback(year)
+
+    if not trading_dates:
+        return 0, f"获取 {year} 年交易日历失败"
+
+    # 生成全年日历数据（标记交易日和非交易日）
+    from datetime import date as date_type
+
+    start_date = date_type(year, 1, 1)
+    end_date = date_type(year, 12, 31)
+
+    calendar_data = []
+    current_date = start_date
+
+    while current_date <= end_date:
+        is_trading = current_date in trading_dates
+        calendar_data.append({
+            "trade_date": current_date,
+            "is_trading_day": 1 if is_trading else 0
+        })
+        current_date += timedelta(days=1)
+
+    # 批量保存
+    created = crud.batch_create_trading_calendar(db, calendar_data)
+
+    trading_count = len(trading_dates)
+    message = f"已刷新 {year} 年交易日历，共 {len(calendar_data)} 天，其中 {trading_count} 个交易日"
+    logger.info(f"[交易日历] {message}")
+
+    return created, message
+
+
+def is_trading_day(db, target_date: date = None) -> Tuple[bool, str]:
+    """
+    判断指定日期是否为交易日（多层数据源 + 3层兜底）
+
+    数据源优先级：
+    1. 数据库缓存（最准确，已同步）
+    2. exchange_calendars 快速判断（备用）
+    3. 周末判断（基础兜底）
+
+    Args:
+        db: 数据库会话
+        target_date: 目标日期，默认为今天
+
+    Returns:
+        Tuple[bool, str]: (是否为交易日, 原因说明)
+    """
+    from . import crud
+
+    if target_date is None:
+        target_date = date.today()
+
+    year = target_date.year
+
+    # 第1层：检查数据库缓存
+    if not crud.is_year_cached(db, year):
+        # 缓存不存在，尝试获取并缓存
+        logger.info(f"[交易日历] {year} 年缓存不存在，开始获取")
+        refresh_trading_calendar(db, year)
+
+    # 查询数据库
+    calendar = crud.get_trading_calendar_by_date(db, target_date)
+
+    if calendar is not None:
+        # 数据库有数据，直接返回
+        if calendar.is_trading_day == 1:
+            return True, "交易日"
+        else:
+            if target_date.weekday() >= 5:
+                return False, "周末"
+            return False, "节假日"
+
+    # 第2层：使用 exchange_calendars 快速判断
+    try:
+        import exchange_calendars as xcals
+        xshg = xcals.get_calendar("XSHG")
+        date_str = target_date.strftime("%Y-%m-%d")
+        is_session = xshg.is_session(date_str)
+        logger.info(f"[交易日历-L2兜底] exchange_calendars 判断 {date_str}: {'交易日' if is_session else '非交易日'}")
+        if is_session:
+            return True, "交易日（备用数据源）"
+        else:
+            if target_date.weekday() >= 5:
+                return False, "周末"
+            return False, "非交易日（备用数据源）"
+    except Exception as e:
+        logger.warning(f"[交易日历-L2兜底] exchange_calendars 判断失败: {e}")
+
+    # 第3层：基础周末判断（最终兜底）
+    if target_date.weekday() >= 5:
+        return False, "周末"
+    return True, "工作日（基础判断）"
+
+
+def fetch_historical_kline_data(symbol: str, target_date: date, ma_types: List[str] = None) -> Tuple[Optional[float], Optional[Dict]]:
+    """
+    获取历史 K 线数据，用于生成历史快照
+
+    Args:
+        symbol: 股票代码
+        target_date: 目标日期
+        ma_types: MA 类型列表，如 ["MA5", "MA20"]
+
+    Returns:
+        Tuple[Optional[float], Optional[Dict]]: (收盘价, MA结果字典)
+    """
+    import re
+
+    if ma_types is None:
+        ma_types = ["MA5"]
+
+    code, market = normalize_symbol_for_sina(symbol)
+
+    # 计算 K 线数据长度（取最大 MA 周期 + 额外天数以确保覆盖目标日期）
+    max_ma_period = 5  # 默认值
+    for ma in ma_types:
+        match = re.search(r'\d+', ma)
+        if match:
+            max_ma_period = max(max_ma_period, int(match.group()))
+
+    # 获取足够的 K 线数据（目标日期前后各取一些）
+    datalen = max_ma_period + 30  # 多取一些确保有目标日期的数据
+
+    if market == "cn":
+        url = f"http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol={code}&scale=240&ma=no&datalen={datalen}"
+    else:
+        url = f"https://stock.finance.sina.com.cn/usstock/api/jsonp.php/IO.Direct.Quotes.getKLineData?symbol={code}&scale=240&ma=no&datalen={datalen}"
+
+    response, _ = _http_get(url, "历史K线数据", symbol=symbol)
+
+    if response is None:
+        logger.warning(f"[历史K线数据] 获取失败 | 股票: {symbol} | 日期: {target_date}")
+        return None, None
+
+    try:
+        if market == "us":
+            match = re.search(r'\[.*\]', response.text)
+            data = json.loads(match.group()) if match else []
+        else:
+            data = response.json()
+
+        if not data or not isinstance(data, list):
+            logger.warning(f"[历史K线数据] 数据为空 | 股票: {symbol}")
+            return None, None
+
+        # 查找目标日期的 K 线数据
+        target_date_str = target_date.strftime("%Y-%m-%d")
+        target_kline = None
+        target_index = -1
+
+        for i, item in enumerate(data):
+            kline_date = item.get('day', '').split(' ')[0]
+            if kline_date == target_date_str:
+                target_kline = item
+                target_index = i
+                break
+
+        if target_kline is None:
+            logger.warning(f"[历史K线数据] 未找到目标日期数据 | 股票: {symbol} | 日期: {target_date}")
+            return None, None
+
+        # 获取收盘价
+        close_price = float(target_kline.get('close', 0))
+        if close_price <= 0:
+            logger.warning(f"[历史K线数据] 收盘价无效 | 股票: {symbol} | 日期: {target_date}")
+            return None, None
+
+        # 计算各 MA 值
+        ma_results = {}
+        for ma_type in ma_types:
+            match = re.search(r'\d+', ma_type)
+            if not match:
+                continue
+            ma_period = int(match.group())
+
+            # 计算该日期的 MA（使用目标日期及之前的收盘价）
+            closes = []
+            for j in range(max(0, target_index - ma_period + 1), target_index + 1):
+                closes.append(float(data[j].get('close', 0)))
+
+            if len(closes) >= ma_period and all(c > 0 for c in closes):
+                ma_val = round(sum(closes) / ma_period, 2)
+                diff = close_price - ma_val
+                ma_results[ma_type] = {
+                    "ma_price": ma_val,
+                    "reached_target": close_price >= ma_val,
+                    "price_difference": round(diff, 2),
+                    "price_difference_percent": round((diff / ma_val) * 100, 2) if ma_val > 0 else 0
+                }
+                logger.debug(f"[历史K线数据] {ma_type}: {ma_val} | 收盘价: {close_price} | 股票: {symbol}")
+
+        logger.info(f"[历史K线数据] 获取成功 | 股票: {symbol} | 日期: {target_date} | 收盘价: {close_price} | MA数量: {len(ma_results)}")
+
+        return close_price, ma_results
+
+    except Exception as e:
+        logger.error(f"[历史K线数据] 解析异常 | 股票: {symbol} | 日期: {target_date} | 错误: {e}")
+        return None, None
+
+
 def get_last_trading_day_close() -> datetime:
     """
     获取最近一个交易日的收盘时间（北京时间）
@@ -581,20 +948,25 @@ def enrich_stocks_batch(stocks: List[Stock], force_refresh: bool = False, max_wo
 
 # ============ 快照和报告服务 ============
 
-def generate_daily_snapshots(db, force: bool = False) -> Tuple[int, int, str]:
+def generate_daily_snapshots(db, force: bool = False, target_date: date = None) -> Tuple[int, int, str]:
     """
-    为所有监控的股票生成今日快照
+    为所有监控的股票生成快照
 
     Args:
         db: 数据库会话
         force: 是否强制刷新（即使已有快照）
+        target_date: 目标日期，默认为今天。历史日期使用 K 线收盘价。
 
     Returns:
         Tuple[int, int, str]: (新建数量, 更新数量, 消息)
     """
     from . import crud
 
-    today = date.today()
+    if target_date is None:
+        target_date = date.today()
+
+    # 判断是否为历史日期
+    is_historical = target_date < date.today()
 
     # 获取所有股票
     stocks = db.query(Stock).all()
@@ -604,45 +976,94 @@ def generate_daily_snapshots(db, force: bool = False) -> Tuple[int, int, str]:
 
     created_count = 0
     updated_count = 0
+    skipped_count = 0
 
-    # 使用并发获取所有股票的实时数据
-    enriched_stocks = enrich_stocks_batch(stocks, force_refresh=True)
+    if is_historical:
+        # 历史日期：使用 K 线数据
+        logger.info(f"[快照生成] 生成历史快照 | 日期: {target_date} | 股票数: {len(stocks)}")
 
-    for enriched in enriched_stocks:
-        # 构建 ma_results 字典
-        ma_results = {}
-        for ma_type, result in enriched.ma_results.items():
-            ma_results[ma_type] = {
-                "ma_price": result.ma_price,
-                "reached_target": result.reached_target,
-                "price_difference": result.price_difference,
-                "price_difference_percent": result.price_difference_percent
-            }
+        for stock in stocks:
+            # 检查是否已存在快照
+            existing = crud.get_snapshot(db, stock.id, target_date)
+            if existing and not force:
+                skipped_count += 1
+                continue
 
-        # 检查是否已存在快照
-        existing = crud.get_snapshot(db, enriched.id, today)
+            # 解析 ma_types
+            if stock.ma_types and stock.ma_types.strip():
+                ma_types_list = [ma.strip() for ma in stock.ma_types.split(",") if ma.strip()]
+            else:
+                ma_types_list = ["MA5"]
 
-        if existing:
-            if force:
+            # 获取历史 K 线数据
+            close_price, ma_results = fetch_historical_kline_data(stock.symbol, target_date, ma_types_list)
+
+            if close_price is None or close_price <= 0:
+                logger.warning(f"[快照生成] 跳过股票 {stock.symbol}，无法获取历史数据")
+                skipped_count += 1
+                continue
+
+            # 添加数据来源标记
+            for ma_type in ma_results:
+                ma_results[ma_type]["data_source"] = "kline_close"
+
+            # 保存快照
+            crud.create_or_update_snapshot(
+                db, stock.id, target_date,
+                close_price,
+                ma_results
+            )
+
+            if existing:
+                updated_count += 1
+            else:
+                created_count += 1
+
+    else:
+        # 当天：使用实时数据
+        logger.info(f"[快照生成] 生成今日快照 | 日期: {target_date} | 股票数: {len(stocks)}")
+
+        # 使用并发获取所有股票的实时数据
+        enriched_stocks = enrich_stocks_batch(stocks, force_refresh=True)
+
+        for enriched in enriched_stocks:
+            # 构建 ma_results 字典
+            ma_results = {}
+            for ma_type, result in enriched.ma_results.items():
+                ma_results[ma_type] = {
+                    "ma_price": result.ma_price,
+                    "reached_target": result.reached_target,
+                    "price_difference": result.price_difference,
+                    "price_difference_percent": result.price_difference_percent,
+                    "data_source": "realtime"
+                }
+
+            # 检查是否已存在快照
+            existing = crud.get_snapshot(db, enriched.id, target_date)
+
+            if existing:
+                if force:
+                    crud.create_or_update_snapshot(
+                        db, enriched.id, target_date,
+                        enriched.current_price or 0,
+                        ma_results
+                    )
+                    updated_count += 1
+            else:
                 crud.create_or_update_snapshot(
-                    db, enriched.id, today,
+                    db, enriched.id, target_date,
                     enriched.current_price or 0,
                     ma_results
                 )
-                updated_count += 1
-        else:
-            crud.create_or_update_snapshot(
-                db, enriched.id, today,
-                enriched.current_price or 0,
-                ma_results
-            )
-            created_count += 1
+                created_count += 1
 
     message = f"已生成 {created_count} 个新快照"
     if updated_count > 0:
         message += f"，更新 {updated_count} 个现有快照"
+    if skipped_count > 0:
+        message += f"，跳过 {skipped_count} 个"
 
-    logger.info(f"[快照生成] {message} | 日期: {today}")
+    logger.info(f"[快照生成] {message} | 日期: {target_date}")
 
     return created_count, updated_count, message
 

@@ -1,5 +1,5 @@
 /**
- * 每日报告页面 - 展示股票指标变化和趋势，支持查看历史报告
+ * 每日报告页面 - 展示股票指标变化和趋势，支持查看历史报告和交易日判断
  */
 import { useState, useEffect } from "react";
 import {
@@ -17,6 +17,8 @@ import {
   Typography,
   Divider,
   DatePicker,
+  Alert,
+  Modal,
 } from "antd";
 import {
   RiseOutlined,
@@ -26,6 +28,8 @@ import {
   StockOutlined,
   LeftOutlined,
   RightOutlined,
+  ClockCircleOutlined,
+  WarningOutlined,
 } from "@ant-design/icons";
 import dayjs from "dayjs";
 import { stockApi } from "../services/api";
@@ -35,6 +39,7 @@ const { Title, Text } = Typography;
 const DailyReport = () => {
   const [loading, setLoading] = useState(false);
   const [generating, setGenerating] = useState(false);
+  const [checkingTradingDay, setCheckingTradingDay] = useState(false); // 交易日检查状态
   const [snapshotStatus, setSnapshotStatus] = useState(null);
   const [report, setReport] = useState(null);
   const [trendData, setTrendData] = useState(null);
@@ -42,6 +47,8 @@ const DailyReport = () => {
   const [selectedDate, setSelectedDate] = useState(null);
   const [prevDate, setPrevDate] = useState(null);
   const [nextDate, setNextDate] = useState(null);
+  const [tradingDayInfo, setTradingDayInfo] = useState(null); // 交易日信息
+  const [isNonTradingDay, setIsNonTradingDay] = useState(false); // 是否为非交易日
 
   // 加载快照日期列表
   const loadSnapshotDates = async () => {
@@ -70,10 +77,39 @@ const DailyReport = () => {
     }
   };
 
+  // 检查交易日状态
+  const checkTradingDayStatus = async (targetDate = null) => {
+    setCheckingTradingDay(true);
+    try {
+      const dateStr = targetDate ? targetDate.format("YYYY-MM-DD") : null;
+      const data = await stockApi.checkTradingDay(dateStr);
+      setTradingDayInfo(data);
+      setIsNonTradingDay(!data.is_trading_day);
+      return data;
+    } catch (error) {
+      console.error("检查交易日失败:", error);
+      message.error("无法获取交易日信息，请稍后重试");
+      return null;
+    } finally {
+      setCheckingTradingDay(false);
+    }
+  };
+
   // 加载报告数据
   const loadReport = async (targetDate = null) => {
     setLoading(true);
+    setIsNonTradingDay(false);
+
     try {
+      // 先检查是否为交易日
+      const tradingInfo = await checkTradingDayStatus(targetDate);
+      if (tradingInfo && !tradingInfo.is_trading_day) {
+        setIsNonTradingDay(true);
+        setReport(null);
+        setLoading(false);
+        return;
+      }
+
       const dateStr = targetDate ? targetDate.format("YYYY-MM-DD") : null;
       const [reportData, trend] = await Promise.all([
         stockApi.getDailyReport(dateStr),
@@ -86,45 +122,87 @@ const DailyReport = () => {
       if (targetDate) {
         const currentDate = targetDate.format("YYYY-MM-DD");
         const currentIdx = availableDates.findIndex(
-          (d) => d.format("YYYY-MM-DD") === currentDate
+          (d) => d.format("YYYY-MM-DD") === currentDate,
         );
-        setPrevDate(
-          currentIdx > 0 ? availableDates[currentIdx - 1] : null
-        );
+        setPrevDate(currentIdx > 0 ? availableDates[currentIdx - 1] : null);
         setNextDate(
           currentIdx < availableDates.length - 1
             ? availableDates[currentIdx + 1]
-            : null
+            : null,
         );
       }
     } catch (error) {
-      message.error("加载报告失败: " + error.message);
+      // 处理非交易日错误
+      if (error.detail && error.detail.is_trading_day === false) {
+        setIsNonTradingDay(true);
+        setTradingDayInfo(error.detail);
+        setReport(null);
+      } else {
+        message.error("加载报告失败: " + error.message);
+      }
     } finally {
       setLoading(false);
     }
   };
 
-  // 生成快照
-  const handleGenerateSnapshots = async () => {
+  // 生成快照（支持指定日期）
+  const handleGenerateSnapshots = async (targetDate = null) => {
     setGenerating(true);
     try {
-      const result = await stockApi.generateSnapshots();
+      const dateStr = targetDate ? targetDate.format("YYYY-MM-DD") : null;
+      const result = await stockApi.generateSnapshots(dateStr);
       message.success(result.message);
       await loadSnapshotStatus();
       await loadSnapshotDates();
-      await loadReport();
+      await loadReport(targetDate);
     } catch (error) {
-      message.error("生成快照失败: " + error.message);
+      // 处理非交易日错误
+      if (error.detail && error.detail.is_trading_day === false) {
+        message.warning(`该日期为非交易日（${error.detail.reason}）`);
+      } else {
+        message.error("生成快照失败: " + error.message);
+      }
     } finally {
       setGenerating(false);
     }
   };
 
   // 日期选择变化
-  const handleDateChange = (date) => {
+  const handleDateChange = async (date) => {
     if (!date) return;
     setSelectedDate(date);
-    loadReport(date);
+
+    // 检查是否为交易日
+    const tradingInfo = await checkTradingDayStatus(date);
+    if (tradingInfo && !tradingInfo.is_trading_day) {
+      setIsNonTradingDay(true);
+      setReport(null);
+      return;
+    }
+
+    // 检查该日期是否有快照
+    const dateStr = date.format("YYYY-MM-DD");
+    const hasSnapshot = availableDates.some(
+      (d) => d.format("YYYY-MM-DD") === dateStr,
+    );
+
+    if (!hasSnapshot) {
+      // 无快照，弹出确认对话框询问是否生成
+      Modal.confirm({
+        title: "该日期暂无分析报告",
+        content: `是否为 ${dateStr} 生成分析报告？`,
+        okText: "确认生成",
+        cancelText: "取消",
+        onOk: () => handleGenerateSnapshots(date),
+        onCancel: () => {
+          // 用户取消，保持在当前视图
+          setSelectedDate(null);
+        },
+      });
+    } else {
+      // 有快照，直接加载报告
+      loadReport(date);
+    }
   };
 
   // 导航到前一日期
@@ -143,18 +221,26 @@ const DailyReport = () => {
     }
   };
 
-  // 禁用没有快照的日期
+  // 禁用未来日期（只能选择今天及之前的日期）
   const disabledDate = (current) => {
     if (!current) return true;
-    const dateStr = current.format("YYYY-MM-DD");
-    return !availableDates.some((d) => d.format("YYYY-MM-DD") === dateStr);
+    // 禁用今天之后的日期
+    return current && current.isAfter(dayjs().endOf("day"));
   };
 
   useEffect(() => {
     const init = async () => {
       const dates = await loadSnapshotDates();
       const status = await loadSnapshotStatus();
-      if (status && status.has_snapshots) {
+
+      // 检查今天是否为交易日
+      const tradingInfo = await checkTradingDayStatus();
+
+      if (tradingInfo && !tradingInfo.is_trading_day) {
+        // 非交易日，不自动加载报告
+        setIsNonTradingDay(true);
+      } else if (status && status.has_snapshots) {
+        // 交易日且已有快照，加载报告
         await loadReport();
       }
     };
@@ -310,7 +396,7 @@ const DailyReport = () => {
     );
   };
 
-  // 没有快照时的提示
+  // 没有快照时的提示（区分交易日和非交易日）
   if (!loading && snapshotStatus && !snapshotStatus.has_snapshots) {
     return (
       <div style={{ padding: "24px" }}>
@@ -320,23 +406,45 @@ const DailyReport = () => {
             description={
               <Space direction="vertical" size="large">
                 <div>
-                  <CalendarOutlined
-                    style={{ fontSize: "48px", color: "#1890ff" }}
-                  />
+                  {isNonTradingDay ? (
+                    <ClockCircleOutlined
+                      style={{ fontSize: "48px", color: "#faad14" }}
+                    />
+                  ) : (
+                    <CalendarOutlined
+                      style={{ fontSize: "48px", color: "#1890ff" }}
+                    />
+                  )}
                 </div>
-                <Title level={4}>今日还没有生成快照</Title>
-                <Text type="secondary">
-                  快照用于保存股票的当前状态，生成后可以查看每日报告和趋势分析
-                </Text>
-                <Button
-                  type="primary"
-                  size="large"
-                  icon={<SyncOutlined spin={generating} />}
-                  loading={generating}
-                  onClick={handleGenerateSnapshots}
-                >
-                  生成今日快照
-                </Button>
+                {isNonTradingDay ? (
+                  <>
+                    <Title level={4}>今日为非交易日</Title>
+                    <Text type="secondary">
+                      {tradingDayInfo?.reason === "周末"
+                        ? "股票市场周末休市"
+                        : tradingDayInfo?.reason === "节假日"
+                          ? "股票市场节假日休市"
+                          : "该日期市场休市"}
+                    </Text>
+                    <Text type="secondary">您可以选择历史交易日查看报告</Text>
+                  </>
+                ) : (
+                  <>
+                    <Title level={4}>今日还没有生成快照</Title>
+                    <Text type="secondary">
+                      快照用于保存股票的当前状态，生成后可以查看每日报告和趋势分析
+                    </Text>
+                    <Button
+                      type="primary"
+                      size="large"
+                      icon={<SyncOutlined spin={generating} />}
+                      loading={generating}
+                      onClick={() => handleGenerateSnapshots()}
+                    >
+                      生成今日快照
+                    </Button>
+                  </>
+                )}
               </Space>
             }
           />
@@ -353,6 +461,21 @@ const DailyReport = () => {
             <StockOutlined />
             <span>每日报告</span>
             {report && <Tag color="blue">{report.report_date}</Tag>}
+            {checkingTradingDay && (
+              <Tag color="processing" icon={<SyncOutlined spin />}>
+                检查中...
+              </Tag>
+            )}
+            {!checkingTradingDay && tradingDayInfo && (
+              <Tag
+                color={tradingDayInfo.is_trading_day ? "success" : "warning"}
+                icon={
+                  tradingDayInfo.is_trading_day ? null : <ClockCircleOutlined />
+                }
+              >
+                {tradingDayInfo.is_trading_day ? "交易日" : "休市"}
+              </Tag>
+            )}
           </Space>
         }
         extra={
@@ -381,14 +504,33 @@ const DailyReport = () => {
             <Button
               icon={<SyncOutlined spin={generating} />}
               loading={generating}
-              onClick={handleGenerateSnapshots}
+              onClick={() => handleGenerateSnapshots(selectedDate)}
+              disabled={isNonTradingDay}
             >
-              刷新快照
+              {selectedDate && !selectedDate.isSame(dayjs(), "day")
+                ? "生成历史快照"
+                : "刷新快照"}
             </Button>
           </Space>
         }
       >
         <Spin spinning={loading}>
+          {/* 非交易日提示 */}
+          {isNonTradingDay && (
+            <Alert
+              message="该日期为非交易日"
+              description={
+                <Space direction="vertical">
+                  <span>原因：{tradingDayInfo?.reason || "市场休市"}</span>
+                  <span>您可以选择历史交易日查看或生成报告</span>
+                </Space>
+              }
+              type="warning"
+              icon={<WarningOutlined />}
+              showIcon
+              style={{ marginBottom: 24 }}
+            />
+          )}
           {report ? (
             <>
               {/* 概览卡片 */}
@@ -485,9 +627,7 @@ const DailyReport = () => {
                       <Space>
                         <RiseOutlined style={{ color: "#52c41a" }} />
                         <span>新增达标</span>
-                        <Tag color="success">
-                          {report.newly_reached.length}
-                        </Tag>
+                        <Tag color="success">{report.newly_reached.length}</Tag>
                       </Space>
                     }
                     size="small"
@@ -495,9 +635,7 @@ const DailyReport = () => {
                     {report.newly_reached.length > 0 ? (
                       <List
                         dataSource={report.newly_reached}
-                        renderItem={(item) =>
-                          renderChangeItem(item, "reached")
-                        }
+                        renderItem={(item) => renderChangeItem(item, "reached")}
                         size="small"
                       />
                     ) : (

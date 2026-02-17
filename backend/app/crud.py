@@ -287,3 +287,58 @@ def get_adjacent_snapshot_dates(db: Session, current_date: date) -> Dict[str, Op
         "prev": prev_snapshot.snapshot_date if prev_snapshot else None,
         "next": next_snapshot.snapshot_date if next_snapshot else None
     }
+
+
+# --- 交易日历相关操作 ---
+
+def get_trading_calendar_by_date(db: Session, trade_date: date) -> Optional[models.TradingCalendar]:
+    """获取指定日期的交易日历记录"""
+    return db.query(models.TradingCalendar).filter(
+        models.TradingCalendar.trade_date == trade_date
+    ).first()
+
+
+def get_trading_calendar_by_year(db: Session, year: int) -> List[models.TradingCalendar]:
+    """获取指定年份的所有交易日历记录"""
+    return db.query(models.TradingCalendar).filter(
+        models.TradingCalendar.year == year
+    ).all()
+
+
+def is_year_cached(db: Session, year: int) -> bool:
+    """检查指定年份的交易日历是否已缓存"""
+    count = db.query(models.TradingCalendar).filter(
+        models.TradingCalendar.year == year
+    ).count()
+    return count > 0
+
+
+def batch_create_trading_calendar(db: Session, calendar_data: List[Dict]) -> int:
+    """批量创建交易日历记录"""
+    created_count = 0
+    for item in calendar_data:
+        # 检查是否已存在
+        existing = get_trading_calendar_by_date(db, item["trade_date"])
+        if existing:
+            # 更新现有记录
+            existing.is_trading_day = item["is_trading_day"]
+        else:
+            # 创建新记录
+            db_calendar = models.TradingCalendar(
+                trade_date=item["trade_date"],
+                is_trading_day=item["is_trading_day"],
+                year=item["trade_date"].year
+            )
+            db.add(db_calendar)
+            created_count += 1
+    db.commit()
+    return created_count
+
+
+def delete_trading_calendar_by_year(db: Session, year: int) -> int:
+    """删除指定年份的交易日历缓存"""
+    count = db.query(models.TradingCalendar).filter(
+        models.TradingCalendar.year == year
+    ).delete()
+    db.commit()
+    return count

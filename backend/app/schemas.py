@@ -136,6 +136,23 @@ class DailyReportSummary(BaseModel):
     reached_rate_change: float = Field(..., description="达标率变化(百分点)")
 
 
+class ReachedIndicator(BaseModel):
+    """单个达标指标"""
+    ma_type: str = Field(..., description="MA类型，如MA5、MA20")
+    ma_price: float = Field(..., description="均线价格")
+    price_difference_percent: float = Field(..., description="偏离百分比")
+
+
+class ReachedStockItem(BaseModel):
+    """达标股票项（聚合多个达标指标）"""
+    stock_id: int = Field(..., description="股票ID")
+    symbol: str = Field(..., description="股票代码")
+    name: str = Field(..., description="股票名称")
+    current_price: float = Field(..., description="当前价格")
+    max_deviation_percent: float = Field(..., description="最大偏离百分比")
+    reached_indicators: List[ReachedIndicator] = Field(default_factory=list, description="所有达标的指标列表")
+
+
 class DailyReportResponse(BaseModel):
     """每日报告响应"""
     report_date: date = Field(..., description="报告日期")
@@ -143,6 +160,8 @@ class DailyReportResponse(BaseModel):
     summary: DailyReportSummary
     newly_reached: List[StockChangeItem] = Field(default_factory=list, description="新增达标的股票")
     newly_below: List[StockChangeItem] = Field(default_factory=list, description="跌破均线的股票")
+    reached_stocks: List[ReachedStockItem] = Field(default_factory=list, description="今日达标个股列表（分页）")
+    total_reached: int = Field(0, description="达标个股总数")
 
 
 class TrendDataPoint(BaseModel):

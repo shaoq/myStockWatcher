@@ -137,7 +137,8 @@ def create_stock(stock: schemas.StockCreate, db: Session = Depends(get_db)):
 
     stock.name = fetched_name
     created_stock = crud.create_stock(db=db, stock=stock)
-    return services.enrich_stock_with_status(created_stock)
+    # 新增股票，需要计算指标，设置 need_calc=True
+    return services.enrich_stock_with_status(created_stock, db=db, need_calc=True)
 
 @app.get("/stocks/", response_model=List[schemas.StockWithStatus], tags=["股票管理"])
 def read_stocks(
@@ -164,8 +165,8 @@ def read_stocks(
 
     stocks = query.offset(skip).limit(limit).all()
 
-    # 使用并发处理批量富化股票数据
-    return services.enrich_stocks_batch(stocks, force_refresh=False)
+    # 使用并发处理批量富化股票数据（普通查询不需要强制计算）
+    return services.enrich_stocks_batch(stocks, force_refresh=False, db=db, need_calc=False)
 
 
 @app.post("/stocks/batch-delete", tags=["股票管理"])
@@ -221,10 +222,12 @@ def read_stock(stock_id: int, db: Session = Depends(get_db)):
 
 @app.put("/stocks/{stock_id}", response_model=schemas.StockWithStatus, tags=["股票管理"])
 def update_stock(stock_id: int, stock_update: schemas.StockUpdate, db: Session = Depends(get_db)):
+    """更新股票信息（修改指标时需要重新计算，设置 need_calc=True）"""
     updated_stock = crud.update_stock(db, stock_id=stock_id, stock_update=stock_update)
     if updated_stock is None:
         raise HTTPException(status_code=404, detail="未找到该股票")
-    return services.enrich_stock_with_status(updated_stock)
+    # 修改指标需要重新计算，设置 need_calc=True
+    return services.enrich_stock_with_status(updated_stock, db=db, need_calc=True)
 
 @app.delete("/stocks/{stock_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["股票管理"])
 def delete_stock(stock_id: int, db: Session = Depends(get_db)):
@@ -240,11 +243,14 @@ def update_stock_price_by_symbol(symbol: str, db: Session = Depends(get_db)):
     if db_stock is None:
         raise HTTPException(status_code=404, detail="数据库中未找到该股票")
 
-    # 使用智能缓存模式（非强制刷新）
-    enriched = services.enrich_stock_with_status(db_stock, force_refresh=False)
+    # 使用智能缓存模式（非强制刷新，普通刷新不需要重新计算）
+    enriched = services.enrich_stock_with_status(db_stock, force_refresh=False, db=db, need_calc=False)
 
     if enriched.current_price is None:
-        raise HTTPException(status_code=503, detail="数据获取失败，请稍后再试")
+        raise HTTPException(
+            status_code=503,
+            detail=f"股票 {symbol} 数据获取失败，可能已停牌、退市或代码变更，请检查股票代码"
+        )
 
     # 只有实时获取的数据才更新数据库
     if enriched.is_realtime:
@@ -269,12 +275,12 @@ def update_stock_price_by_symbol(symbol: str, db: Session = Depends(get_db)):
 
 @app.post("/stocks/update-all-prices", tags=["价格查询"])
 def update_all_prices(db: Session = Depends(get_db)):
-    """批量刷新所有监控指标（强制绕过缓存，并发处理）"""
+    """批量刷新所有监控指标（智能缓存：交易时间内实时获取，非交易时间使用缓存）"""
     # 使用 joinedload 预加载 groups 关联，避免 N+1 查询
     stocks = db.query(models.Stock).options(joinedload(models.Stock.groups)).all()
 
-    # 使用并发处理批量富化股票数据
-    enriched_stocks = services.enrich_stocks_batch(stocks, force_refresh=True)
+    # 使用智能缓存模式（非强制刷新，全量刷新也不需要重新计算）
+    enriched_stocks = services.enrich_stocks_batch(stocks, force_refresh=False, db=db, need_calc=False)
 
     # 批量更新数据库中的价格
     count = 0
@@ -401,12 +407,18 @@ def get_snapshot_dates(db: Session = Depends(get_db)):
 
 
 @app.get("/reports/daily", response_model=schemas.DailyReportResponse, tags=["每日报告"])
-def get_daily_report(target_date: Optional[date] = None, db: Session = Depends(get_db)):
+def get_daily_report(
+    target_date: Optional[date] = None,
+    page: int = Query(1, ge=1, description="页码，从1开始"),
+    page_size: int = Query(10, ge=1, le=50, description="每页条数，默认10，最大50"),
+    db: Session = Depends(get_db)
+):
     """
-    获取每日报告（支持指定日期）
+    获取每日报告（支持指定日期和分页）
 
     - 交易日：返回报告数据
     - 非交易日：返回错误，提示休市
+    - page/page_size：用于达标个股列表的分页
     """
     if target_date is None:
         target_date = date.today()
@@ -425,14 +437,16 @@ def get_daily_report(target_date: Optional[date] = None, db: Session = Depends(g
             }
         )
 
-    report = services.get_daily_report(db, target_date)
+    report = services.get_daily_report(db, target_date, page=page, page_size=page_size)
 
     return schemas.DailyReportResponse(
         report_date=report["date"],
         has_yesterday=report["has_yesterday"],
         summary=schemas.DailyReportSummary(**report["summary"]),
         newly_reached=[schemas.StockChangeItem(**item) for item in report["newly_reached"]],
-        newly_below=[schemas.StockChangeItem(**item) for item in report["newly_below"]]
+        newly_below=[schemas.StockChangeItem(**item) for item in report["newly_below"]],
+        reached_stocks=[schemas.ReachedStockItem(**item) for item in report["reached_stocks"]],
+        total_reached=report["total_reached"]
     )
 
 

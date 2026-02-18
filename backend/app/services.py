@@ -4,13 +4,17 @@ import json
 import re
 import logging
 import time
-from typing import Optional, Dict, Tuple, List
+import threading
+from typing import Optional, Dict, Tuple, List, TYPE_CHECKING
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from .schemas import StockWithStatus
 from .models import Stock
 from datetime import datetime, date, timezone, timedelta
 from zoneinfo import ZoneInfo
 from cachetools import TTLCache
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -29,6 +33,12 @@ price_cache = TTLCache(maxsize=100, ttl=5)
 
 # 股票名称缓存：24小时有效
 name_cache = TTLCache(maxsize=500, ttl=86400)
+
+# ============ 线程锁 ============
+# 交易日历刷新锁，防止并发刷新
+_trading_calendar_lock = threading.Lock()
+# 正在刷新的年份集合
+_refreshing_years = set()
 
 
 # ============ 交易时间判断 ============
@@ -79,6 +89,30 @@ def is_us_trading_time() -> bool:
     trading_end = t(16, 0)
 
     return trading_start <= current_time <= trading_end
+
+
+def is_real_trading_time(market: str, db=None) -> bool:
+    """
+    判断当前是否为真正的交易时间（交易日 + 交易时间段）
+
+    Args:
+        market: "cn" 表示A股，"us" 表示美股
+        db: 数据库会话（用于交易日判断）
+
+    Returns:
+        bool: 是否在真正的交易时间内
+    """
+    # 首先判断是否在交易时间段内
+    if not is_trading_time(market):
+        return False
+
+    # 对于A股，还需要判断是否为交易日
+    if market == "cn" and db is not None:
+        is_trading, _ = is_trading_day(db)
+        return is_trading
+
+    # 美股或其他情况，暂时只判断交易时间
+    return True
 
 
 def is_trading_time(market: str) -> bool:
@@ -296,7 +330,7 @@ def refresh_trading_calendar(db, year: int = None) -> Tuple[int, str]:
     return created, message
 
 
-def is_trading_day(db, target_date: date = None) -> Tuple[bool, str]:
+def is_trading_day(db=None, target_date: date = None) -> Tuple[bool, str]:
     """
     判断指定日期是否为交易日（多层数据源 + 3层兜底）
 
@@ -306,57 +340,75 @@ def is_trading_day(db, target_date: date = None) -> Tuple[bool, str]:
     3. 周末判断（基础兜底）
 
     Args:
-        db: 数据库会话
+        db: 数据库会话（可选，如不传入则创建独立会话）
         target_date: 目标日期，默认为今天
 
     Returns:
         Tuple[bool, str]: (是否为交易日, 原因说明)
     """
     from . import crud
+    from .database import SessionLocal
 
     if target_date is None:
         target_date = date.today()
 
     year = target_date.year
 
-    # 第1层：检查数据库缓存
-    if not crud.is_year_cached(db, year):
-        # 缓存不存在，尝试获取并缓存
-        logger.info(f"[交易日历] {year} 年缓存不存在，开始获取")
-        refresh_trading_calendar(db, year)
+    # 【修复】使用独立的数据库会话，避免并发问题
+    use_local_session = db is None
+    if use_local_session:
+        db = SessionLocal()
+
+    try:
+        # 第1层：检查数据库缓存（使用锁保护，防止并发刷新）
+        if not crud.is_year_cached(db, year):
+            # 使用锁保护刷新操作，防止多个线程同时刷新
+            with _trading_calendar_lock:
+                # 双重检查：获取锁后再次确认是否已被其他线程刷新
+                if not crud.is_year_cached(db, year) and year not in _refreshing_years:
+                    _refreshing_years.add(year)
+                    try:
+                        logger.info(f"[交易日历] {year} 年缓存不存在，开始获取")
+                        refresh_trading_calendar(db, year)
+                    finally:
+                        _refreshing_years.discard(year)
 
     # 查询数据库
-    calendar = crud.get_trading_calendar_by_date(db, target_date)
+        calendar = crud.get_trading_calendar_by_date(db, target_date)
 
-    if calendar is not None:
-        # 数据库有数据，直接返回
-        if calendar.is_trading_day == 1:
-            return True, "交易日"
-        else:
-            if target_date.weekday() >= 5:
-                return False, "周末"
-            return False, "节假日"
+        if calendar is not None:
+            # 数据库有数据，直接返回
+            if calendar.is_trading_day == 1:
+                return True, "交易日"
+            else:
+                if target_date.weekday() >= 5:
+                    return False, "周末"
+                return False, "节假日"
 
-    # 第2层：使用 exchange_calendars 快速判断
-    try:
-        import exchange_calendars as xcals
-        xshg = xcals.get_calendar("XSHG")
-        date_str = target_date.strftime("%Y-%m-%d")
-        is_session = xshg.is_session(date_str)
-        logger.info(f"[交易日历-L2兜底] exchange_calendars 判断 {date_str}: {'交易日' if is_session else '非交易日'}")
-        if is_session:
-            return True, "交易日（备用数据源）"
-        else:
-            if target_date.weekday() >= 5:
-                return False, "周末"
-            return False, "非交易日（备用数据源）"
-    except Exception as e:
-        logger.warning(f"[交易日历-L2兜底] exchange_calendars 判断失败: {e}")
+        # 第2层：使用 exchange_calendars 快速判断
+        try:
+            import exchange_calendars as xcals
+            xshg = xcals.get_calendar("XSHG")
+            date_str = target_date.strftime("%Y-%m-%d")
+            is_session = xshg.is_session(date_str)
+            logger.info(f"[交易日历-L2兜底] exchange_calendars 判断 {date_str}: {'交易日' if is_session else '非交易日'}")
+            if is_session:
+                return True, "交易日（备用数据源）"
+            else:
+                if target_date.weekday() >= 5:
+                    return False, "周末"
+                return False, "非交易日（备用数据源）"
+        except Exception as e:
+            logger.warning(f"[交易日历-L2兜底] exchange_calendars 判断失败: {e}")
 
-    # 第3层：基础周末判断（最终兜底）
-    if target_date.weekday() >= 5:
-        return False, "周末"
-    return True, "工作日（基础判断）"
+        # 第3层：基础周末判断（最终兜底）
+        if target_date.weekday() >= 5:
+            return False, "周末"
+        return True, "工作日（基础判断）"
+    finally:
+        # 【修复】关闭独立创建的会话
+        if use_local_session:
+            db.close()
 
 
 def fetch_historical_kline_data(symbol: str, target_date: date, ma_types: List[str] = None) -> Tuple[Optional[float], Optional[Dict]]:
@@ -487,26 +539,40 @@ def get_last_trading_day_close() -> datetime:
     return now_beijing.replace(hour=15, minute=0, second=0, microsecond=0)
 
 
-def should_refresh_price(stock: Stock, market: str) -> Tuple[bool, str]:
+def should_refresh_price(stock: Stock, market: str, db = None, need_calc: bool = False) -> Tuple[bool, str]:
     """
     判断是否需要刷新价格数据
 
     Args:
         stock: 股票对象
         market: 市场类型 ("cn" 或 "us")
+        db: 数据库会话（用于交易日判断）
+        need_calc: 是否需要计算（新增股票/指标时为True）
 
     Returns:
         Tuple[bool, str]: (是否需要刷新, 原因说明)
     """
-    # 1. 如果在交易时间内，始终刷新
+    # 1. 如果需要计算（新增股票/指标），直接获取数据
+    if need_calc:
+        return True, "新增股票或指标变更，获取最近交易日数据"
+
+    # 2. 判断是否为交易日（如果有 db 参数）
+    if db is not None and market == "cn":
+        is_trading, reason = is_trading_day(db)
+        if not is_trading:
+            # 非交易日，不刷新，使用缓存
+            return False, f"非交易日（{reason}），使用缓存数据"
+
+    # 3. 如果在交易时间内，刷新获取实时数据
     if is_trading_time(market):
         return True, "交易时间内，实时获取最新价格"
 
-    # 2. 如果当前价格为空，需要获取
+    # 4. 非交易时间，检查是否需要更新收盘数据
+    # 如果当前价格为空，需要获取
     if stock.current_price is None:
         return True, "当前价格为空，需要获取"
 
-    # 3. 非交易时间，检查数据是否已是最新的收盘数据
+    # 检查数据是否已是最新的收盘数据
     if stock.updated_at is None:
         return True, "更新时间为空，需要获取"
 
@@ -614,12 +680,20 @@ def fetch_realtime_data(symbol: str, use_cache: bool = True) -> Tuple[Optional[f
             data = match.group(1).split(',')
             if market == "cn" and len(data) > 3:
                 price, name = float(data[3]), data[0]
+                # 【修复】价格为 0 表示无效数据（停牌、退市等），返回 None
+                if price <= 0:
+                    logger.warning(f"[新浪实时行情] 价格无效 | 股票: {symbol} | 价格: {price} | 耗时: {elapsed_ms:.0f}ms")
+                    return None, None
                 # 存入缓存
                 price_cache[symbol] = (price, name)
                 logger.info(f"[新浪实时行情] 解析成功 | 股票: {symbol} | 名称: {name} | 价格: {price} | 耗时: {elapsed_ms:.0f}ms")
                 return price, name
             elif market == "us" and len(data) > 1:
                 price, name = float(data[1]), data[0]
+                # 【修复】价格为 0 表示无效数据
+                if price <= 0:
+                    logger.warning(f"[新浪实时行情] 价格无效 | 股票: {symbol} | 价格: {price} | 耗时: {elapsed_ms:.0f}ms")
+                    return None, None
                 # 存入缓存
                 price_cache[symbol] = (price, name)
                 logger.info(f"[新浪实时行情] 解析成功 | 股票: {symbol} | 名称: {name} | 价格: {price} | 耗时: {elapsed_ms:.0f}ms")
@@ -729,12 +803,14 @@ def get_stock_chart_urls(symbol: str) -> Dict[str, str]:
     return urls
 
 
-def enrich_stock_with_status(stock: Stock, force_refresh: bool = False) -> StockWithStatus:
+def enrich_stock_with_status(stock: Stock, force_refresh: bool = False, db = None, need_calc: bool = False) -> StockWithStatus:
     """为股票对象添加实时价格和多指标状态信息（带缓存 + 交易时间智能缓存）
 
     Args:
         stock: 股票对象
         force_refresh: 是否强制刷新（绕过缓存），默认 False
+        db: 数据库会话（用于交易日判断）
+        need_calc: 是否需要计算（新增股票/指标时为True，非交易时间也会获取数据）
 
     Returns:
         StockWithStatus: 包含 is_realtime 字段，标识数据是否为实时获取
@@ -744,19 +820,24 @@ def enrich_stock_with_status(stock: Stock, force_refresh: bool = False) -> Stock
     # 获取市场类型
     _, market = normalize_symbol_for_sina(stock.symbol)
 
-    # 智能缓存决策：判断是否需要刷新数据
+    # 智能缓存决策：判断是否需要获取数据
+    need_fetch_data = False
     is_realtime = False
     refresh_reason = ""
 
     if force_refresh:
-        is_realtime = True
+        need_fetch_data = True
+        # 只有在真正的交易时间内才标记为实时（交易日 + 交易时间段）
+        is_realtime = is_real_trading_time(market, db=db)
         refresh_reason = "强制刷新"
     else:
-        need_refresh, refresh_reason = should_refresh_price(stock, market)
+        need_refresh, refresh_reason = should_refresh_price(stock, market, db=db, need_calc=need_calc)
         if need_refresh:
-            is_realtime = True
+            need_fetch_data = True
+            # 只有在真正的交易时间内才标记为实时（交易日 + 交易时间段）
+            is_realtime = is_real_trading_time(market, db=db)
 
-    logger.info(f"[数据富化] 开始处理 | 股票: {stock.symbol} ({stock.name}) | 指标: {stock.ma_types} | 实时模式: {is_realtime} | 原因: {refresh_reason}")
+    logger.info(f"[数据富化] 开始处理 | 股票: {stock.symbol} ({stock.name}) | 指标: {stock.ma_types} | 实时模式: {is_realtime} | 获取数据: {need_fetch_data} | 原因: {refresh_reason}")
     enrich_start = time.time()
 
     # 解析 ma_types，过滤无效值
@@ -773,18 +854,19 @@ def enrich_stock_with_status(stock: Stock, force_refresh: bool = False) -> Stock
     ma_results = {}
 
     # 根据智能缓存决策获取数据
-    if is_realtime:
-        # 【实时模式】请求 API 获取最新数据
+    if need_fetch_data:
+        # 【获取数据模式】请求 API 获取最新数据
         current_price, _ = fetch_realtime_data(stock.symbol, use_cache=False)
     else:
         # 【缓存模式】使用数据库中已有的价格
         current_price = stock.current_price
 
-        # 【修复】如果缓存价格为 None，强制重新获取
-        if current_price is None:
-            logger.warning(f"[智能缓存] 缓存价格为空，强制刷新 | 股票: {stock.symbol}")
+        # 【修复】如果缓存价格为 None 或 0，强制重新获取
+        if current_price is None or current_price <= 0:
+            logger.warning(f"[智能缓存] 缓存价格无效，强制刷新 | 股票: {stock.symbol} | 缓存价格: {current_price}")
             current_price, _ = fetch_realtime_data(stock.symbol, use_cache=False)
-            is_realtime = True  # 标记为实时获取
+            # 只有在真正的交易时间内才标记为实时（交易日 + 交易时间段）
+            is_realtime = is_real_trading_time(market, db=db)
         else:
             logger.info(f"[智能缓存] 使用缓存数据 | 股票: {stock.symbol} | 价格: {current_price}")
 
@@ -830,16 +912,30 @@ def enrich_stock_with_status(stock: Stock, force_refresh: bool = False) -> Stock
                     data = response.json()
 
                 if data and isinstance(data, list):
-                    kline_closes = [float(item['close']) for item in data]
+                    # 【修复】过滤无效的 close 值，避免 None 或空字符串导致后续计算错误
+                    kline_closes = []
+                    for item in data:
+                        close_val = item.get('close')
+                        if close_val is not None and close_val != '' and close_val != 0:
+                            try:
+                                kline_closes.append(float(close_val))
+                            except (ValueError, TypeError):
+                                pass  # 跳过无效数据
                     today_str = datetime.now().strftime("%Y-%m-%d")
-                    last_day = data[-1]['day'].split(' ')[0]
+                    last_day = data[-1].get('day', '').split(' ')[0] if data else ''
                     if last_day != today_str and current_price is not None:
                         kline_closes.append(current_price)
-                    # 存入缓存
-                    kline_cache[cache_key] = kline_closes
+                    # 存入缓存（仅当有有效数据时）
+                    if kline_closes:
+                        kline_cache[cache_key] = kline_closes
                     logger.info(f"[新浪K线数据] 获取成功 | 股票: {stock.symbol} | K线数量: {len(kline_closes)} | 耗时: {kline_elapsed:.0f}ms")
             except Exception as e:
                 logger.error(f"[新浪K线数据] 解析异常 | 股票: {stock.symbol} | 错误: {e}")
+
+    # 【新增】如果实时价格获取失败（停牌、退市等），使用 K 线历史数据的最后收盘价
+    if current_price is None and kline_closes and len(kline_closes) > 0:
+        current_price = kline_closes[-1]
+        logger.info(f"[历史数据兜底] 使用 K 线最后收盘价 | 股票: {stock.symbol} | 价格: {current_price}")
 
     # 【优化3】本地计算所有 MA 值（无需再次请求 API）
     for ma_type in ma_types_list:
@@ -848,9 +944,15 @@ def enrich_stock_with_status(stock: Stock, force_refresh: bool = False) -> Stock
 
         if current_price is not None and kline_closes and len(kline_closes) >= ma_period:
             final_closes = kline_closes[-ma_period:]
-            ma_val = round(sum(final_closes) / ma_period, 2)
+            # 【安全检查】过滤掉可能的 None 值
+            final_closes = [c for c in final_closes if c is not None]
 
-            if ma_val > 0:
+            if len(final_closes) >= ma_period:
+                ma_val = round(sum(final_closes) / ma_period, 2)
+            else:
+                ma_val = None
+
+            if ma_val is not None and ma_val > 0:
                 diff = current_price - ma_val
                 res = MAResult(
                     ma_price=ma_val,
@@ -891,7 +993,7 @@ def enrich_stock_with_status(stock: Stock, force_refresh: bool = False) -> Stock
     )
 
 
-def enrich_stocks_batch(stocks: List[Stock], force_refresh: bool = False, max_workers: int = 10) -> List[StockWithStatus]:
+def enrich_stocks_batch(stocks: List[Stock], force_refresh: bool = False, max_workers: int = 10, db = None, need_calc: bool = False) -> List[StockWithStatus]:
     """
     并发富化多只股票的状态信息
 
@@ -899,6 +1001,8 @@ def enrich_stocks_batch(stocks: List[Stock], force_refresh: bool = False, max_wo
         stocks: 股票对象列表
         force_refresh: 是否强制刷新（绕过缓存）
         max_workers: 最大并发线程数，默认10
+        db: 数据库会话（用于交易日判断）
+        need_calc: 是否需要计算（新增股票/指标时为True）
 
     Returns:
         List[StockWithStatus]: 富化后的股票状态列表
@@ -907,17 +1011,18 @@ def enrich_stocks_batch(stocks: List[Stock], force_refresh: bool = False, max_wo
         return []
 
     batch_start = time.time()
-    logger.info(f"[批量富化] 开始处理 {len(stocks)} 只股票 | 并发数: {max_workers} | 强制刷新: {force_refresh}")
+    logger.info(f"[批量富化] 开始处理 {len(stocks)} 只股票 | 并发数: {max_workers} | 强制刷新: {force_refresh} | 需要计算: {need_calc}")
 
     results = [None] * len(stocks)  # 预分配结果列表，保持顺序
 
     def process_stock(index, stock):
         """处理单只股票并返回带索引的结果"""
         try:
-            result = enrich_stock_with_status(stock, force_refresh=force_refresh)
+            result = enrich_stock_with_status(stock, force_refresh=force_refresh, db=db, need_calc=need_calc)
             return (index, result)
         except Exception as e:
-            logger.error(f"[批量富化] 处理失败 | 股票: {stock.symbol} | 错误: {e}")
+            import traceback
+            logger.error(f"[批量富化] 处理失败 | 股票: {stock.symbol} | 错误: {e}\n{traceback.format_exc()}")
             return (index, None)
 
     # 使用线程池并发处理
@@ -1068,13 +1173,15 @@ def generate_daily_snapshots(db, force: bool = False, target_date: date = None) 
     return created_count, updated_count, message
 
 
-def get_daily_report(db, target_date: date = None) -> Dict:
+def get_daily_report(db, target_date: date = None, page: int = 1, page_size: int = 10) -> Dict:
     """
     生成每日报告
 
     Args:
         db: 数据库会话
         target_date: 目标日期，默认为今天
+        page: 页码（用于达标个股分页），从1开始
+        page_size: 每页条数，默认10，最大50
 
     Returns:
         Dict: 报告数据
@@ -1083,6 +1190,10 @@ def get_daily_report(db, target_date: date = None) -> Dict:
 
     if target_date is None:
         target_date = date.today()
+
+    # 分页参数约束
+    page = max(1, page)
+    page_size = min(max(1, page_size), 50)  # 最小1，最大50
 
     # 获取目标日期快照
     target_snapshots = crud.get_snapshots_by_date(db, target_date)
@@ -1101,7 +1212,9 @@ def get_daily_report(db, target_date: date = None) -> Dict:
                 "reached_rate_change": 0.0
             },
             "newly_reached": [],
-            "newly_below": []
+            "newly_below": [],
+            "reached_stocks": [],
+            "total_reached": 0
         }
 
     # 获取前一交易日快照
@@ -1127,6 +1240,9 @@ def get_daily_report(db, target_date: date = None) -> Dict:
     newly_reached_list = []
     newly_below_list = []
 
+    # ========== 新增：达标个股聚合 ==========
+    reached_stocks_map = {}  # stock_id -> {stock_info, indicators: []}
+
     # 昨日达标率
     yesterday_reached_count = 0
     yesterday_total = 0
@@ -1139,8 +1255,39 @@ def get_daily_report(db, target_date: date = None) -> Dict:
         if is_reached:
             reached_count += 1
 
-        # 对比昨日
+        # ========== 新增：收集达标指标的详细信息 ==========
         stock = stocks.get(snap.stock_id)
+        if stock and is_reached:
+            reached_indicators = []
+            max_deviation = 0.0
+
+            for ma_type, result in ma_results.items():
+                if result.get("reached_target", False):
+                    deviation = result.get("price_difference_percent", 0)
+                    reached_indicators.append({
+                        "ma_type": ma_type,
+                        "ma_price": result.get("ma_price", 0),
+                        "price_difference_percent": deviation
+                    })
+                    max_deviation = max(max_deviation, abs(deviation))
+
+            # 保留原始符号（正/负）
+            original_max_deviation = max(
+                (r["price_difference_percent"] for r in reached_indicators),
+                key=abs,
+                default=0
+            )
+
+            reached_stocks_map[snap.stock_id] = {
+                "stock_id": snap.stock_id,
+                "symbol": stock.symbol,
+                "name": stock.name,
+                "current_price": snap.price or 0,
+                "max_deviation_percent": original_max_deviation,
+                "reached_indicators": reached_indicators
+            }
+
+        # 对比昨日
         if stock and snap.stock_id in yesterday_data:
             yesterday_ma = yesterday_data[snap.stock_id]["ma_results"]
 
@@ -1184,6 +1331,21 @@ def get_daily_report(db, target_date: date = None) -> Dict:
     today_rate = (reached_count / total_stocks * 100) if total_stocks > 0 else 0
     yesterday_rate = (yesterday_reached_count / yesterday_total * 100) if yesterday_total > 0 else 0
     rate_change = today_rate - yesterday_rate if has_yesterday else 0
+
+    # ========== 新增：排序 + 分页 ==========
+    # 按偏离度降序排序（偏离越大越靠前）
+    all_reached_stocks = sorted(
+        reached_stocks_map.values(),
+        key=lambda x: abs(x["max_deviation_percent"]),
+        reverse=True
+    )
+
+    total_reached = len(all_reached_stocks)
+
+    # 分页
+    start_idx = (page - 1) * page_size
+    end_idx = start_idx + page_size
+    paginated_reached_stocks = all_reached_stocks[start_idx:end_idx]
 
     return {
         "date": target_date,
@@ -1198,121 +1360,9 @@ def get_daily_report(db, target_date: date = None) -> Dict:
             "reached_rate_change": round(rate_change, 1)
         },
         "newly_reached": newly_reached_list,
-        "newly_below": newly_below_list
-    }
-
-    if not today_snapshots:
-        return {
-            "date": today,
-            "has_today": False,
-            "has_yesterday": False,
-            "summary": {
-                "total_stocks": 0,
-                "reached_count": 0,
-                "newly_reached": 0,
-                "newly_below": 0,
-                "reached_rate": 0.0,
-                "reached_rate_change": 0.0
-            },
-            "newly_reached": [],
-            "newly_below": []
-        }
-
-    # 获取昨日快照（按日期降序取第一个不是今天的）
-    yesterday_snapshots = crud.get_previous_trading_day_snapshots(db, today)
-
-    # 构建昨日数据索引
-    yesterday_data = {}
-    for snap in yesterday_snapshots:
-        if snap.snapshot_date < today:
-            yesterday_data[snap.stock_id] = {
-                "date": snap.snapshot_date,
-                "ma_results": json.loads(snap.ma_results) if snap.ma_results else {}
-            }
-
-    has_yesterday = len(yesterday_data) > 0
-
-    # 获取所有股票信息
-    stocks = {s.id: s for s in db.query(Stock).all()}
-
-    # 统计今日数据
-    total_stocks = len(today_snapshots)
-    reached_count = 0
-    newly_reached_list = []
-    newly_below_list = []
-
-    # 昨日达标率
-    yesterday_reached_count = 0
-    yesterday_total = 0
-
-    for snap in today_snapshots:
-        ma_results = json.loads(snap.ma_results) if snap.ma_results else {}
-
-        # 判断今日是否达标（任一 MA 达标即算达标）
-        is_reached = any(r.get("reached_target", False) for r in ma_results.values())
-        if is_reached:
-            reached_count += 1
-
-        # 对比昨日
-        stock = stocks.get(snap.stock_id)
-        if stock and snap.stock_id in yesterday_data:
-            yesterday_ma = yesterday_data[snap.stock_id]["ma_results"]
-
-            for ma_type, today_result in ma_results.items():
-                today_reached = today_result.get("reached_target", False)
-                yesterday_result = yesterday_ma.get(ma_type, {})
-                yesterday_reached = yesterday_result.get("reached_target", False)
-
-                # 检测变化
-                if today_reached and not yesterday_reached:
-                    # 新增达标
-                    newly_reached_list.append({
-                        "stock_id": snap.stock_id,
-                        "symbol": stock.symbol,
-                        "name": stock.name,
-                        "ma_type": ma_type,
-                        "current_price": snap.price,
-                        "ma_price": today_result.get("ma_price", 0),
-                        "price_difference_percent": today_result.get("price_difference_percent", 0)
-                    })
-                elif not today_reached and yesterday_reached:
-                    # 跌破均线
-                    newly_below_list.append({
-                        "stock_id": snap.stock_id,
-                        "symbol": stock.symbol,
-                        "name": stock.name,
-                        "ma_type": ma_type,
-                        "current_price": snap.price,
-                        "ma_price": today_result.get("ma_price", 0),
-                        "price_difference_percent": today_result.get("price_difference_percent", 0)
-                    })
-
-    # 计算昨日达标率
-    if has_yesterday:
-        for snap_data in yesterday_data.values():
-            yesterday_total += 1
-            if any(r.get("reached_target", False) for r in snap_data["ma_results"].values()):
-                yesterday_reached_count += 1
-
-    # 计算达标率变化
-    today_rate = (reached_count / total_stocks * 100) if total_stocks > 0 else 0
-    yesterday_rate = (yesterday_reached_count / yesterday_total * 100) if yesterday_total > 0 else 0
-    rate_change = today_rate - yesterday_rate if has_yesterday else 0
-
-    return {
-        "date": today,
-        "has_today": True,
-        "has_yesterday": has_yesterday,
-        "summary": {
-            "total_stocks": total_stocks,
-            "reached_count": reached_count,
-            "newly_reached": len(newly_reached_list),
-            "newly_below": len(newly_below_list),
-            "reached_rate": round(today_rate, 1),
-            "reached_rate_change": round(rate_change, 1)
-        },
-        "newly_reached": newly_reached_list,
-        "newly_below": newly_below_list
+        "newly_below": newly_below_list,
+        "reached_stocks": paginated_reached_stocks,
+        "total_reached": total_reached
     }
 
 

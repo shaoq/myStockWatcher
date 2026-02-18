@@ -307,10 +307,13 @@ def get_trading_calendar_by_year(db: Session, year: int) -> List[models.TradingC
 
 def is_year_cached(db: Session, year: int) -> bool:
     """检查指定年份的交易日历是否已缓存"""
-    count = db.query(models.TradingCalendar).filter(
-        models.TradingCalendar.year == year
-    ).count()
-    return count > 0
+    try:
+        count = db.query(models.TradingCalendar).filter(
+            models.TradingCalendar.year == year
+        ).count()
+        return count is not None and count > 0
+    except Exception:
+        return False
 
 
 def batch_create_trading_calendar(db: Session, calendar_data: List[Dict]) -> int:

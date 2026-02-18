@@ -19,6 +19,8 @@ import {
   DatePicker,
   Alert,
   Modal,
+  Table,
+  Pagination,
 } from "antd";
 import {
   RiseOutlined,
@@ -49,6 +51,11 @@ const DailyReport = () => {
   const [nextDate, setNextDate] = useState(null);
   const [tradingDayInfo, setTradingDayInfo] = useState(null); // 交易日信息
   const [isNonTradingDay, setIsNonTradingDay] = useState(false); // 是否为非交易日
+
+  // 达标个股分页状态
+  const [reachedPage, setReachedPage] = useState(1);
+  const [reachedPageSize, setReachedPageSize] = useState(10);
+  const [reachedTotal, setReachedTotal] = useState(0);
 
   // 加载快照日期列表
   const loadSnapshotDates = async () => {
@@ -96,7 +103,7 @@ const DailyReport = () => {
   };
 
   // 加载报告数据
-  const loadReport = async (targetDate = null) => {
+  const loadReport = async (targetDate = null, page = 1, pageSize = 10) => {
     setLoading(true);
     setIsNonTradingDay(false);
 
@@ -112,11 +119,12 @@ const DailyReport = () => {
 
       const dateStr = targetDate ? targetDate.format("YYYY-MM-DD") : null;
       const [reportData, trend] = await Promise.all([
-        stockApi.getDailyReport(dateStr),
+        stockApi.getDailyReport(dateStr, page, pageSize),
         stockApi.getTrendData(7),
       ]);
       setReport(reportData);
       setTrendData(trend.data);
+      setReachedTotal(reportData.total_reached || 0);
 
       // 更新相邻日期
       if (targetDate) {
@@ -201,7 +209,8 @@ const DailyReport = () => {
       });
     } else {
       // 有快照，直接加载报告
-      loadReport(date);
+      setReachedPage(1); // 重置页码
+      loadReport(date, 1, reachedPageSize);
     }
   };
 
@@ -209,7 +218,8 @@ const DailyReport = () => {
   const handlePrevDate = () => {
     if (prevDate) {
       setSelectedDate(prevDate);
-      loadReport(prevDate);
+      setReachedPage(1); // 重置页码
+      loadReport(prevDate, 1, reachedPageSize);
     }
   };
 
@@ -217,7 +227,22 @@ const DailyReport = () => {
   const handleNextDate = () => {
     if (nextDate) {
       setSelectedDate(nextDate);
-      loadReport(nextDate);
+      setReachedPage(1); // 重置页码
+      loadReport(nextDate, 1, reachedPageSize);
+    }
+  };
+
+  // 达标个股分页变化
+  const handleReachedPageChange = async (page, pageSize) => {
+    setReachedPage(page);
+    setReachedPageSize(pageSize);
+    const dateStr = selectedDate ? selectedDate.format("YYYY-MM-DD") : null;
+    try {
+      const reportData = await stockApi.getDailyReport(dateStr, page, pageSize);
+      setReport(reportData);
+      setReachedTotal(reportData.total_reached || 0);
+    } catch (error) {
+      message.error("加载数据失败: " + error.message);
     }
   };
 
@@ -672,6 +697,100 @@ const DailyReport = () => {
                   </Card>
                 </Col>
               </Row>
+
+              {/* 今日达标个股 */}
+              <Card
+                title={
+                  <Space>
+                    <span>今日达标个股</span>
+                    <Tag color="success">{reachedTotal}只</Tag>
+                  </Space>
+                }
+                style={{ marginBottom: 24 }}
+              >
+                {report.reached_stocks && report.reached_stocks.length > 0 ? (
+                  <>
+                    <Table
+                      dataSource={report.reached_stocks}
+                      rowKey="stock_id"
+                      pagination={false}
+                      size="small"
+                      columns={[
+                        {
+                          title: "代码",
+                          dataIndex: "symbol",
+                          key: "symbol",
+                          width: 100,
+                          render: (text) => (
+                            <span style={{ fontWeight: "bold" }}>{text}</span>
+                          ),
+                        },
+                        {
+                          title: "名称",
+                          dataIndex: "name",
+                          key: "name",
+                          width: 120,
+                          render: (text) => (
+                            <span style={{ color: "#8c8c8c" }}>{text}</span>
+                          ),
+                        },
+                        {
+                          title: "达标指标",
+                          dataIndex: "reached_indicators",
+                          key: "reached_indicators",
+                          render: (indicators) => (
+                            <Space size={4}>
+                              {indicators.map((ind, idx) => (
+                                <Tag key={idx} color="success">
+                                  {ind.ma_type}
+                                </Tag>
+                              ))}
+                            </Space>
+                          ),
+                        },
+                        {
+                          title: "现价",
+                          dataIndex: "current_price",
+                          key: "current_price",
+                          width: 100,
+                          render: (price) => `¥${price?.toFixed(2)}`,
+                        },
+                        {
+                          title: "最大偏离",
+                          dataIndex: "max_deviation_percent",
+                          key: "max_deviation_percent",
+                          width: 100,
+                          render: (percent) => (
+                            <span
+                              style={{ color: "#52c41a", fontWeight: "bold" }}
+                            >
+                              +{percent?.toFixed(2)}%
+                            </span>
+                          ),
+                        },
+                      ]}
+                    />
+                    {reachedTotal > reachedPageSize && (
+                      <div style={{ marginTop: 16, textAlign: "right" }}>
+                        <Pagination
+                          current={reachedPage}
+                          pageSize={reachedPageSize}
+                          total={reachedTotal}
+                          onChange={handleReachedPageChange}
+                          showSizeChanger
+                          showTotal={(total) => `共 ${total} 条`}
+                          pageSizeOptions={["10", "20", "50"]}
+                        />
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <Empty
+                    image={Empty.PRESENTED_IMAGE_SIMPLE}
+                    description="暂无达标个股"
+                  />
+                )}
+              </Card>
 
               {/* 趋势图表 */}
               <Card title="近 7 日趋势">{renderTrendChart()}</Card>

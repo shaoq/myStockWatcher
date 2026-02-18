@@ -41,14 +41,15 @@ import StockChart from "./StockChart";
 const { Option } = Select;
 
 /**
- * 判断当前是否为A股交易时间
- * A股交易时间：工作日 9:30-11:30, 13:00-15:00
+ * 判断当前是否处于A股交易时间段
+ * A股交易时间：9:30-11:30, 13:00-15:00
+ * 注意：此函数只判断时间，不判断是否为交易日（交易日由后端 API 判断）
  * 性能优化：使用缓存避免重复计算
  */
 let tradingTimeCache = { value: null, timestamp: 0 };
 const TRADING_CACHE_TTL = 30000; // 30秒缓存
 
-const isTradingTime = () => {
+const isInTradingHours = () => {
   const now = Date.now();
 
   // 使用缓存
@@ -60,16 +61,9 @@ const isTradingTime = () => {
   }
 
   const date = new Date();
-  const day = date.getDay();
   const hours = date.getHours();
   const minutes = date.getMinutes();
   const currentTime = hours * 60 + minutes;
-
-  // 周六、周日不交易
-  if (day === 0 || day === 6) {
-    tradingTimeCache = { value: false, timestamp: now };
-    return false;
-  }
 
   // 上午交易时间 9:30-11:30
   const morningStart = 9 * 60 + 30;
@@ -120,7 +114,9 @@ const StockList = ({ groupId, groups: parentGroups, onGroupsChange }) => {
   const [filterType, setFilterType] = useState("all"); // 'all', 'allReached', 'partiallyReached', 'allBelow'
 
   // 智能缓存相关状态
-  const [isTrading, setIsTrading] = useState(isTradingTime());
+  const [isTradingDay, setIsTradingDay] = useState(false); // 是否为交易日（后端判断）
+  const [isTrading, setIsTrading] = useState(false); // 是否处于交易中（交易日 + 交易时间）
+  const [tradingDayReason, setTradingDayReason] = useState(""); // 交易日状态原因
   const [autoRefreshEnabled, setAutoRefreshEnabled] = useState(true);
   const autoRefreshRef = useRef(null);
 
@@ -195,6 +191,53 @@ const StockList = ({ groupId, groups: parentGroups, onGroupsChange }) => {
     loadGroups();
   }, []);
 
+  // 检查交易日状态（调用后端 API）
+  const checkTradingDayStatus = async () => {
+    try {
+      const data = await stockApi.checkTradingDay();
+      const newIsTradingDay = data.is_trading_day;
+      const newReason = data.reason;
+
+      // 判断是否处于交易中：交易日 + 交易时间
+      const newIsTrading = newIsTradingDay && isInTradingHours();
+
+      // 状态变化时更新
+      if (newIsTradingDay !== isTradingDay) {
+        setIsTradingDay(newIsTradingDay);
+        setTradingDayReason(newReason);
+
+        if (newIsTradingDay) {
+          message.info("今日为交易日");
+        } else {
+          message.info(`今日为非交易日（${newReason}），自动刷新已暂停`);
+        }
+      }
+
+      // 更新交易状态
+      if (newIsTrading !== isTrading) {
+        setIsTrading(newIsTrading);
+        if (newIsTrading && newIsTradingDay) {
+          message.info("已进入交易时间，自动刷新已启用");
+        } else if (!newIsTrading && isTrading) {
+          message.info("已离开交易时间，自动刷新已暂停");
+        }
+      }
+    } catch (error) {
+      console.error("检查交易日失败:", error);
+      // API 失败时，使用纯前端判断作为降级方案
+      const fallbackIsTrading = isInTradingHours();
+      setIsTrading(fallbackIsTrading);
+      setIsTradingDay(fallbackIsTrading);
+      setTradingDayReason("API 降级判断");
+    }
+  };
+
+  // 初始化时检查交易日
+  useEffect(() => {
+    checkTradingDayStatus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // 自动刷新逻辑
   useEffect(() => {
     // 清除已有的定时器
@@ -218,23 +261,31 @@ const StockList = ({ groupId, groups: parentGroups, onGroupsChange }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoRefreshEnabled, isTrading, groupId, searchText]);
 
-  // 每分钟检查一次交易时间状态
+  // 每分钟检查一次交易状态（交易日 + 交易时间）
   useEffect(() => {
     const checkTradingStatus = () => {
-      const currentTradingStatus = isTradingTime();
-      if (currentTradingStatus !== isTrading) {
-        setIsTrading(currentTradingStatus);
-        if (currentTradingStatus) {
-          message.info("已进入交易时间，自动刷新已启用");
-        } else {
-          message.info("已离开交易时间，自动刷新已暂停");
+      // 每5分钟重新检查交易日（应对跨天情况）
+      const now = new Date();
+      if (now.getMinutes() % 5 === 0) {
+        checkTradingDayStatus();
+      } else {
+        // 其他时间只检查交易时间段变化
+        const newIsTrading = isTradingDay && isInTradingHours();
+        if (newIsTrading !== isTrading) {
+          setIsTrading(newIsTrading);
+          if (newIsTrading) {
+            message.info("已进入交易时间，自动刷新已启用");
+          } else {
+            message.info("已离开交易时间，自动刷新已暂停");
+          }
         }
       }
     };
 
     const interval = setInterval(checkTradingStatus, 60000);
     return () => clearInterval(interval);
-  }, [isTrading]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isTrading, isTradingDay]);
 
   // 根据筛选类型过滤数据
   const filteredStocks = useMemo(() => {
@@ -334,15 +385,38 @@ const StockList = ({ groupId, groups: parentGroups, onGroupsChange }) => {
   };
 
   const handleUpdatePrice = async (symbol) => {
-    setLoading(true);
+    // 非交易时间提示
+    if (!isTrading) {
+      if (!isTradingDay) {
+        message.warning(
+          `今日为${tradingDayReason || "非交易日"}，将使用缓存数据`,
+        );
+      } else {
+        message.info("当前非交易时间，将使用缓存数据");
+      }
+    }
+
     try {
       const result = await stockApi.updateStockPriceBySymbol(symbol);
       message.success(result.message);
-      loadStocks();
+
+      // 只更新单只股票的数据，而不是刷新整个列表
+      setStocks((prevStocks) =>
+        prevStocks.map((stock) => {
+          if (stock.symbol === symbol) {
+            return {
+              ...stock,
+              current_price: result.current_price,
+              ma_results: result.ma_results,
+              is_realtime: result.is_realtime,
+              updated_at: new Date().toISOString(),
+            };
+          }
+          return stock;
+        }),
+      );
     } catch (error) {
       message.error("更新失败: " + error.message);
-    } finally {
-      setLoading(false);
     }
   };
 
@@ -383,6 +457,17 @@ const StockList = ({ groupId, groups: parentGroups, onGroupsChange }) => {
   };
 
   const handleUpdateAllPrices = async () => {
+    // 非交易时间提示
+    if (!isTrading) {
+      if (!isTradingDay) {
+        message.warning(
+          `今日为${tradingDayReason || "非交易日"}，将使用缓存数据`,
+        );
+      } else {
+        message.info("当前非交易时间，将使用缓存数据");
+      }
+    }
+
     setLoading(true);
     try {
       const result = await stockApi.updateAllPrices();
@@ -739,9 +824,13 @@ const StockList = ({ groupId, groups: parentGroups, onGroupsChange }) => {
               <Tag color="processing" icon={<SyncOutlined spin />}>
                 交易中
               </Tag>
+            ) : isTradingDay ? (
+              <Tag color="warning" icon={<ClockCircleOutlined />}>
+                休市（非交易时间）
+              </Tag>
             ) : (
               <Tag color="default" icon={<ClockCircleOutlined />}>
-                休市
+                休市（{tradingDayReason || "非交易日"}）
               </Tag>
             )}
             {filterType !== "all" && (
@@ -794,7 +883,9 @@ const StockList = ({ groupId, groups: parentGroups, onGroupsChange }) => {
                   ? autoRefreshEnabled
                     ? "自动刷新已启用（30秒间隔）"
                     : "自动刷新已暂停"
-                  : "非交易时间，自动刷新不可用"
+                  : isTradingDay
+                    ? "当前非交易时间（9:30-11:30, 13:00-15:00）"
+                    : `今日为${tradingDayReason || "非交易日"}，自动刷新不可用`
               }
             >
               <Space style={{ marginLeft: 8 }}>
@@ -809,7 +900,11 @@ const StockList = ({ groupId, groups: parentGroups, onGroupsChange }) => {
                   disabled={!isTrading}
                 />
                 <span style={{ fontSize: 12, color: "#666" }}>
-                  {isTrading ? "自动刷新" : "非交易时间"}
+                  {isTrading
+                    ? "自动刷新"
+                    : isTradingDay
+                      ? "非交易时间"
+                      : "休市"}
                 </span>
               </Space>
             </Tooltip>

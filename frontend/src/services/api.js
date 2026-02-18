@@ -200,9 +200,9 @@ export const stockApi = {
 
   // --- 每日报告 ---
 
-  // 获取每日报告（支持指定日期）
-  getDailyReport: async (targetDate = null) => {
-    const params = {};
+  // 获取每日报告（支持指定日期和分页）
+  getDailyReport: async (targetDate = null, page = 1, pageSize = 10) => {
+    const params = { page, page_size: pageSize };
     if (targetDate) {
       params.target_date = targetDate;
     }

@@ -54,11 +54,15 @@ function App() {
   const handleAddGroup = async () => {
     try {
       const values = await form.validateFields();
-      await stockApi.createGroup(values);
+      const newGroup = await stockApi.createGroup(values);
       message.success("分组创建成功");
       setIsModalVisible(false);
       form.resetFields();
-      loadGroups();
+      await loadGroups();
+      // 自动选中新创建的分组
+      if (newGroup && newGroup.id) {
+        setSelectedGroupId(newGroup.id.toString());
+      }
     } catch (error) {
       message.error("创建失败");
     }
@@ -86,37 +90,43 @@ function App() {
 
   const menuItems = [
     {
-      key: "all",
+      key: "stock-group",
       icon: <GlobalOutlined />,
       label: "全部股票",
+      children: [
+        {
+          key: "all",
+          label: "全部",
+        },
+        ...groups.map((group) => ({
+          key: group.id.toString(),
+          icon: <FolderOutlined />,
+          label: (
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+              }}
+            >
+              <span>{group.name}</span>
+              <Space>
+                <Tag style={{ marginRight: 0 }}>{group.stock_count}</Tag>
+                <DeleteOutlined
+                  style={{ fontSize: "12px", color: "#ff4d4f" }}
+                  onClick={(e) => handleDeleteGroup(group.id, e)}
+                />
+              </Space>
+            </div>
+          ),
+        })),
+      ],
     },
     {
       key: "daily-report",
       icon: <BarChartOutlined />,
       label: "每日报告",
     },
-    ...groups.map((group) => ({
-      key: group.id.toString(),
-      icon: <FolderOutlined />,
-      label: (
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-          }}
-        >
-          <span>{group.name}</span>
-          <Space>
-            <Tag style={{ marginRight: 0 }}>{group.stock_count}</Tag>
-            <DeleteOutlined
-              style={{ fontSize: "12px", color: "#ff4d4f" }}
-              onClick={(e) => handleDeleteGroup(group.id, e)}
-            />
-          </Space>
-        </div>
-      ),
-    })),
   ];
 
   return (
@@ -157,6 +167,7 @@ function App() {
             <Menu
               mode="inline"
               selectedKeys={[selectedGroupId]}
+              defaultOpenKeys={["stock-group"]}
               style={{ height: "calc(100% - 64px)", borderRight: 0 }}
               items={menuItems}
               onClick={({ key }) => setSelectedGroupId(key)}

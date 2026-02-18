@@ -651,9 +651,14 @@ def normalize_symbol_for_sina(symbol: str) -> Tuple[str, str]:
         if market == "bj": return f"bj{code}", "cn"
         return symbol, "us"
     if len(symbol) == 6:
-        if symbol.startswith(('6', '9')): return f"sh{symbol}", "cn"
+        # 北交所：4/8/92 开头（92开头需优先于其他9开头判断）
+        if symbol.startswith(('4', '8')): return f"bj{symbol}", "cn"
+        if symbol.startswith('92'): return f"bj{symbol}", "cn"
+        # 上交所：6 开头，或其他 9 开头（如科创板CDR）
+        if symbol.startswith('6'): return f"sh{symbol}", "cn"
+        if symbol.startswith('9'): return f"sh{symbol}", "cn"
+        # 深交所：0/3 开头
         if symbol.startswith(('0', '3')): return f"sz{symbol}", "cn"
-        if symbol.startswith(('8', '4')): return f"bj{symbol}", "cn"
     return symbol, "us"
 
 

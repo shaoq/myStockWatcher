@@ -163,7 +163,8 @@ def read_stocks(
     if group_id:
         query = query.join(models.Stock.groups).filter(models.Group.id == group_id)
 
-    stocks = query.offset(skip).limit(limit).all()
+    # 按添加时间降序排列（最近添加的在最前面）
+    stocks = query.order_by(models.Stock.created_at.desc()).offset(skip).limit(limit).all()
 
     # 使用并发处理批量富化股票数据（普通查询不需要强制计算）
     return services.enrich_stocks_batch(stocks, force_refresh=False, db=db, need_calc=False)

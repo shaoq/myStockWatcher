@@ -587,9 +587,16 @@ const StockList = ({ groupId, groups: parentGroups, onGroupsChange }) => {
         const types = record.ma_types || [];
         const results = record.ma_results || {};
 
+        // 按 MA 后面的数字升序排序（如 MA5, MA10, MA20...）
+        const sortedTypes = [...types].sort((a, b) => {
+          const numA = parseInt(a.replace(/[^\d]/g, ""), 10) || 0;
+          const numB = parseInt(b.replace(/[^\d]/g, ""), 10) || 0;
+          return numA - numB;
+        });
+
         return (
           <Space size={[4, 8]} wrap>
-            {types.map((type) => {
+            {sortedTypes.map((type) => {
               const res = results[type];
               if (!res || res.ma_price === null) {
                 return (

@@ -92,7 +92,7 @@ function App() {
     {
       key: "stock-group",
       icon: <GlobalOutlined />,
-      label: "全部股票",
+      label: "股票信息",
       children: [
         {
           key: "all",

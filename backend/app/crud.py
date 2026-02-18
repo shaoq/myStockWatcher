@@ -37,7 +37,8 @@ def get_stocks(
     if group_id:
         query = query.join(models.Stock.groups).filter(models.Group.id == group_id)
 
-    return query.offset(skip).limit(limit).all()
+    # 按添加时间降序排列（最近添加的在最前面）
+    return query.order_by(models.Stock.created_at.desc()).offset(skip).limit(limit).all()
 
 
 def batch_delete_stocks(db: Session, stock_ids: List[int]) -> int:

@@ -78,6 +78,15 @@ export const stockApi = {
     return response.data;
   },
 
+  // 批量归属股票到分组
+  batchAssignGroups: async (stockIds, groupNames) => {
+    const response = await apiClient.post("/stocks/batch-assign-groups", {
+      stock_ids: stockIds,
+      group_names: groupNames,
+    });
+    return response.data;
+  },
+
   // 获取单个股票
   getStock: async (id) => {
     const response = await apiClient.get(`/stocks/${id}`);
@@ -125,6 +134,12 @@ export const stockApi = {
   // 更新所有股票价格
   updateAllPrices: async () => {
     const response = await apiClient.post("/stocks/update-all-prices");
+    return response.data;
+  },
+
+  // 清理缓存并强制刷新所有股票数据
+  clearCacheAndRefresh: async () => {
+    const response = await apiClient.post("/stocks/clear-cache-and-refresh");
     return response.data;
   },
 
@@ -215,14 +230,6 @@ export const stockApi = {
       params.target_date = targetDate;
     }
     const response = await apiClient.get("/reports/daily", { params });
-    return response.data;
-  },
-
-  // 获取趋势数据
-  getTrendData: async (days = 7) => {
-    const response = await apiClient.get("/reports/trend", {
-      params: { days },
-    });
     return response.data;
   },
 };

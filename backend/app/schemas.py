@@ -78,6 +78,7 @@ class StockWithStatus(StockInDB):
     group_names: List[str] = Field([], description="所属分组名称列表")
     group_ids: List[int] = Field([], description="所属分组ID列表")
     is_realtime: bool = Field(False, description="数据是否为实时获取（非缓存）")
+    data_fetched_at: Optional[datetime] = Field(None, description="数据获取时间")
 
 
 class PriceUpdateResponse(BaseModel):
@@ -131,7 +132,8 @@ class DailyReportSummary(BaseModel):
     total_stocks: int = Field(..., description="监控股票总数")
     reached_count: int = Field(..., description="达标股票数")
     newly_reached: int = Field(..., description="新增达标数")
-    newly_below: int = Field(..., description="跌破均线数")
+    newly_below: int = Field(..., description="跌破均线数(新跌破)")
+    continuous_below: int = Field(0, description="持续未达标数")
     reached_rate: float = Field(..., description="达标率(%)")
     reached_rate_change: float = Field(..., description="达标率变化(百分点)")
 
@@ -141,6 +143,19 @@ class ReachedIndicator(BaseModel):
     ma_type: str = Field(..., description="MA类型，如MA5、MA20")
     ma_price: float = Field(..., description="均线价格")
     price_difference_percent: float = Field(..., description="偏离百分比")
+    reach_type: str = Field(..., description="达标类型：new_reach(新增达标) 或 continuous_reach(持续达标)")
+
+
+class BelowStockItem(BaseModel):
+    """未达标股票项（包含跌破类型分类）"""
+    stock_id: int = Field(..., description="股票ID")
+    symbol: str = Field(..., description="股票代码")
+    name: str = Field(..., description="股票名称")
+    current_price: float = Field(..., description="当前价格")
+    ma_type: str = Field(..., description="MA类型，如MA5、MA20")
+    ma_price: float = Field(..., description="均线价格")
+    price_difference_percent: float = Field(..., description="偏离百分比")
+    fall_type: str = Field(..., description="跌破类型: new_fall(新跌破) 或 continuous_below(持续未达标)")
 
 
 class ReachedStockItem(BaseModel):
@@ -159,21 +174,10 @@ class DailyReportResponse(BaseModel):
     has_yesterday: bool = Field(..., description="是否有昨日数据")
     summary: DailyReportSummary
     newly_reached: List[StockChangeItem] = Field(default_factory=list, description="新增达标的股票")
-    newly_below: List[StockChangeItem] = Field(default_factory=list, description="跌破均线的股票")
+    newly_below: List[StockChangeItem] = Field(default_factory=list, description="跌破均线的股票(仅状态变化)")
+    all_below_stocks: List[BelowStockItem] = Field(default_factory=list, description="所有未达标股票(含分类)")
     reached_stocks: List[ReachedStockItem] = Field(default_factory=list, description="今日达标个股列表（分页）")
     total_reached: int = Field(0, description="达标个股总数")
-
-
-class TrendDataPoint(BaseModel):
-    """趋势数据点"""
-    date: str = Field(..., description="日期标签")
-    reached_count: int = Field(..., description="达标数")
-    reached_rate: float = Field(..., description="达标率(%)")
-
-
-class TrendDataResponse(BaseModel):
-    """趋势数据响应"""
-    data: List[TrendDataPoint] = Field(default_factory=list, description="趋势数据点列表")
 
 
 class SnapshotCheckResponse(BaseModel):
@@ -189,3 +193,20 @@ class GenerateSnapshotsResponse(BaseModel):
     message: str
     created_count: int = Field(..., description="新建快照数")
     updated_count: int = Field(..., description="更新快照数")
+
+
+# ============ 批量归属分组相关模式 ============
+
+class BatchAssignGroupsRequest(BaseModel):
+    """批量归属分组请求"""
+    stock_ids: List[int] = Field(..., description="股票ID列表")
+    group_names: List[str] = Field(..., description="分组名称列表（不存在则自动创建）")
+
+
+class BatchAssignGroupsResponse(BaseModel):
+    """批量归属分组响应"""
+    success: bool = Field(..., description="操作是否成功")
+    assigned_count: int = Field(..., description="成功归属的股票数")
+    skipped_count: int = Field(0, description="已在分组内跳过的股票数")
+    created_groups: List[str] = Field(default_factory=list, description="新创建的分组名")
+    message: str = Field(..., description="操作结果消息")

@@ -190,6 +190,33 @@ def batch_remove_from_group(stock_ids: List[int], group_id: int, db: Session = D
     return {"message": f"成功从当前分组移出 {count} 只股票"}
 
 
+@app.post("/stocks/batch-assign-groups", response_model=schemas.BatchAssignGroupsResponse, tags=["股票管理"])
+def batch_assign_groups(
+    request: schemas.BatchAssignGroupsRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    批量将股票归属到分组
+
+    - 采用追加模式（保留原有分组）
+    - 分组不存在时自动创建
+    - 已在分组内的股票自动跳过
+    """
+    if not request.stock_ids:
+        raise HTTPException(status_code=400, detail="股票ID列表不能为空")
+
+    if not request.group_names:
+        raise HTTPException(status_code=400, detail="分组名称列表不能为空")
+
+    result = crud.batch_assign_groups_to_stocks(
+        db,
+        stock_ids=request.stock_ids,
+        group_names=request.group_names
+    )
+
+    return schemas.BatchAssignGroupsResponse(**result)
+
+
 @app.get("/groups/", response_model=List[schemas.GroupInDB], tags=["分组管理"])
 def read_groups(db: Session = Depends(get_db)):
     """获取所有分组"""
@@ -292,6 +319,33 @@ def update_all_prices(db: Session = Depends(get_db)):
 
     return {"message": f"已成功更新 {count} 只股票的均线指标数据"}
 
+
+@app.post("/stocks/clear-cache-and-refresh", tags=["价格查询"])
+def clear_cache_and_refresh(db: Session = Depends(get_db)):
+    """清理所有缓存并强制刷新所有股票数据"""
+    # 1. 清理内存缓存
+    cleared = services.clear_all_caches()
+
+    # 2. 使用 joinedload 预加载 groups 关联
+    stocks = db.query(models.Stock).options(joinedload(models.Stock.groups)).all()
+
+    # 3. 强制刷新所有股票数据（force_refresh=True）
+    enriched_stocks = services.enrich_stocks_batch(stocks, force_refresh=True, db=db, need_calc=False)
+
+    # 4. 批量更新数据库中的价格
+    count = 0
+    for enriched in enriched_stocks:
+        if enriched.current_price is not None:
+            crud.update_stock_price(db, enriched.id, enriched.current_price)
+            count += 1
+
+    return {
+        "message": f"已清理缓存并刷新 {count} 只股票数据",
+        "cleared_cache": cleared,
+        "refreshed_stocks": count
+    }
+
+
 @app.get("/stocks/symbol/{symbol}/charts", tags=["价格查询"])
 def get_stock_charts(symbol: str):
     """获取股票趋势图 URL 池"""
@@ -366,15 +420,24 @@ def get_monthly_trading_days(
 @app.post("/snapshots/generate", response_model=schemas.GenerateSnapshotsResponse, tags=["快照管理"])
 def generate_snapshots(
     target_date: Optional[date] = Query(None, description="目标日期，默认为今天"),
+    force: bool = Query(False, description="是否强制覆盖已有快照"),
     db: Session = Depends(get_db)
 ):
     """
     生成快照（为所有监控的股票保存状态）
 
-    - 交易日：使用实时数据生成快照
-    - 历史交易日：使用 K 线收盘价生成快照
-    - 非交易日：返回错误
+    触发规则:
+    - 历史日期: 用户选择即可触发，已有数据不重复生成（除非 force=True）
+    - 当日: 只有收盘后(>15:00)才能触发
+    - 非交易日: 返回错误提示
+
+    数据来源:
+    - 交易日收盘后: 使用实时数据
+    - 历史交易日: 使用 K 线收盘价
     """
+    from datetime import datetime as dt
+    from zoneinfo import ZoneInfo
+
     if target_date is None:
         target_date = date.today()
 
@@ -392,7 +455,26 @@ def generate_snapshots(
             }
         )
 
-    created, updated, message = services.generate_daily_snapshots(db, force=True, target_date=target_date)
+    # 当日快照：检查是否已收盘
+    if target_date == date.today():
+        beijing_tz = ZoneInfo("Asia/Shanghai")
+        now_beijing = dt.now(beijing_tz)
+        current_time = now_beijing.time()
+
+        # A股收盘时间为 15:00
+        from datetime import time as t
+        if current_time <= t(15, 0):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error": "当日快照请在收盘后（15:00后）生成",
+                    "is_trading_day": True,
+                    "current_time": now_beijing.strftime("%H:%M"),
+                    "hint": "当前仍在交易时间内，请等待收盘后再生成快照"
+                }
+            )
+
+    created, updated, message = services.generate_daily_snapshots(db, force=force, target_date=target_date)
     return schemas.GenerateSnapshotsResponse(
         message=message,
         created_count=created,
@@ -474,16 +556,55 @@ def get_daily_report(
         summary=schemas.DailyReportSummary(**report["summary"]),
         newly_reached=[schemas.StockChangeItem(**item) for item in report["newly_reached"]],
         newly_below=[schemas.StockChangeItem(**item) for item in report["newly_below"]],
+        all_below_stocks=[schemas.BelowStockItem(**item) for item in report["all_below_stocks"]],
         reached_stocks=[schemas.ReachedStockItem(**item) for item in report["reached_stocks"]],
         total_reached=report["total_reached"]
     )
 
 
-@app.get("/reports/trend", response_model=schemas.TrendDataResponse, tags=["每日报告"])
-def get_trend_data(days: int = 7, db: Session = Depends(get_db)):
-    """获取趋势数据（最近 N 天）"""
-    data = services.get_trend_data(db, days)
+# ============ 数据源管理 API ============
 
-    return schemas.TrendDataResponse(
-        data=[schemas.TrendDataPoint(**item) for item in data]
-    )
+@app.get("/providers/health", tags=["数据源管理"])
+def get_providers_health():
+    """
+    获取所有数据源的健康状态
+
+    返回各数据源的:
+    - 优先级
+    - 当前状态 (healthy/degraded/cooling/disabled)
+    - 连续失败次数
+    - 是否可用
+    - 冷却结束时间（如在冷却中）
+    """
+    from .providers import get_coordinator
+    coordinator = get_coordinator()
+    return coordinator.get_health_status()
+
+
+@app.post("/providers/reset", tags=["数据源管理"])
+def reset_provider(provider_name: str = Query(..., description="数据源名称: sina, eastmoney, tencent, netease")):
+    """
+    重置指定数据源的状态
+
+    用于手动恢复被封禁的数据源
+    """
+    from .providers import get_coordinator
+    coordinator = get_coordinator()
+
+    success = coordinator.reset_provider(provider_name)
+    if success:
+        return {"success": True, "message": f"数据源 {provider_name} 状态已重置"}
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"未找到数据源: {provider_name}"
+        )
+
+
+@app.post("/providers/reset-all", tags=["数据源管理"])
+def reset_all_providers():
+    """重置所有数据源的状态"""
+    from .providers import get_coordinator
+    coordinator = get_coordinator()
+    coordinator.reset_all_providers()
+    return {"success": True, "message": "所有数据源状态已重置"}

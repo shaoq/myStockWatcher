@@ -45,7 +45,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `database.py`: 数据库连接配置（SQLite）
 - **`frontend/src/`**:
     - `components/StockList.jsx`: 核心股票管理界面
-    - `components/DailyReport.jsx`: 每日报告页面
+    - `components/DailyReport.jsx`: 每日报告页面（简化版，支持点击查看趋势图）
+    - `components/StockChart.jsx`: 股票趋势图组件（分时图、日K、周K、月K）
     - `services/api.js`: Axios 客户端封装，统一处理后端请求
     - `App.jsx`: 应用主布局与 Ant Design 全局主题配置
 
@@ -65,7 +66,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - 分组管理端点：`/groups/` 系列接口
 - 交易日历端点：`/trading-calendar/check`, `/trading-calendar/refresh`
 - 快照管理端点：`/snapshots/generate`, `/snapshots/check-today`, `/snapshots/dates`
-- 每日报告端点：`/reports/daily`, `/reports/trend`
+- 每日报告端点：`/reports/daily`（支持分页）
 
 ### 数据流向
 1. 用户在前端输入股票代码 → `createStock()` → 后端 `/stocks/`
@@ -142,22 +143,35 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## 每日报告功能
 
 ### 功能概述
-每日报告页面展示股票指标变化和趋势，支持查看历史报告和交易日判断。
+每日报告页面展示股票指标达标状态，支持查看历史报告和交易日判断。
 
 ### 前端实现 (`DailyReport.jsx`)
 
 **主要功能**：
-- 报告概览：监控总数、达标数量、达标率、较昨日变化
-- 状态变化：新增达标 / 跌破均线 股票列表
-- 趋势图表：近 7 日达标趋势可视化
-- 历史报告：日期选择器支持查看历史报告
-- 交易日判断：显示"交易日"或"休市"状态
+- **达标个股列表**：按MA分组展示，区分新增达标/持续达标
+- **未达标个股列表**：按MA分组展示，区分新跌破/持续未达标
+- **点击查看趋势图**：点击股票代码/名称弹出趋势图Modal（分时图、日K、周K、月K）
+- **历史报告**：日期选择器支持查看历史报告
+- **交易日判断**：显示"交易日"或"休市"状态
 
-**日期选择器限制**：
+**MA分组展示**：
+- 按MA数值升序排列（MA5 → MA10 → MA20 → MA60）
+- 组内按偏离度排序（达标降序，未达标升序）
+- 支持折叠面板交互
+
+**点击查看趋势图**：
+- 股票代码显示为蓝色可点击样式
+- 点击后弹出Modal，复用 `StockChart` 组件
+- 支持分时图、日K线、周K线、月K线切换
+
+**日期选择器功能**：
 - 禁用未来日期（只能选择今天及之前的日期）
+- 有报告的日期显示绿色小圆点标记
 - 选择无快照的历史交易日时，弹出确认对话框询问是否生成报告
 
 **关键状态**：
+- `chartModalVisible`: 趋势图Modal可见性
+- `selectedSymbol`: 选中的股票 {symbol, name}
 - `checkingTradingDay`: 交易日检查的 loading 状态
 - `isNonTradingDay`: 是否为非交易日
 - `availableDates`: 有快照的日期列表

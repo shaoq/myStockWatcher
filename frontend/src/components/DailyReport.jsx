@@ -6,7 +6,6 @@ import {
   Card,
   Row,
   Col,
-  Statistic,
   List,
   Tag,
   Button,
@@ -17,10 +16,7 @@ import {
   Typography,
   Divider,
   DatePicker,
-  Alert,
   Modal,
-  Table,
-  Pagination,
   Collapse,
 } from "antd";
 import {
@@ -32,10 +28,10 @@ import {
   LeftOutlined,
   RightOutlined,
   ClockCircleOutlined,
-  WarningOutlined,
 } from "@ant-design/icons";
 import dayjs from "dayjs";
 import { stockApi } from "../services/api";
+import StockChart from "./StockChart";
 
 const { Title, Text } = Typography;
 const { Panel } = Collapse;
@@ -94,13 +90,95 @@ const getSortedGroupKeys = (groups) => {
     .sort((a, b) => getMANumber(a) - getMANumber(b)); // 按数字升序
 };
 
+/**
+ * 按偏离度升序排序（未达标股票用，最负的排前面）
+ * @param {Array} items - 项目数组
+ * @returns {Array} - 排序后的数组
+ */
+const sortBelowItemsByDeviation = (items) => {
+  if (!items) return [];
+  return [...items].sort((a, b) => {
+    const devA = a.price_difference_percent || 0;
+    const devB = b.price_difference_percent || 0;
+    return devA - devB; // 升序（最负的排前面）
+  });
+};
+
+/**
+ * 按未达标类型分组（new_fall 优先）
+ * @param {Array} items - 未达标股票数组
+ * @returns {Object} - { new_fall: [...], continuous_below: [...] }
+ */
+const groupByFallType = (items) => {
+  if (!items || items.length === 0)
+    return { new_fall: [], continuous_below: [] };
+  return items.reduce(
+    (acc, item) => {
+      const fallType = item.fall_type || "continuous_below";
+      if (!acc[fallType]) {
+        acc[fallType] = [];
+      }
+      acc[fallType].push(item);
+      return acc;
+    },
+    { new_fall: [], continuous_below: [] },
+  );
+};
+
+/**
+ * 将聚合的达标股票数据展平为扁平数组（每个指标一条记录）
+ * @param {Array} reachedStocks - 聚合的达标股票数组
+ * @returns {Array} - 扁平化的数组，每个元素包含 stock 信息和单个指标信息
+ */
+const flattenReachedStocks = (reachedStocks) => {
+  if (!reachedStocks || reachedStocks.length === 0) return [];
+
+  const flattened = [];
+  reachedStocks.forEach((stock) => {
+    stock.reached_indicators.forEach((indicator) => {
+      flattened.push({
+        stock_id: stock.stock_id,
+        symbol: stock.symbol,
+        name: stock.name,
+        current_price: stock.current_price,
+        ma_type: indicator.ma_type,
+        ma_price: indicator.ma_price,
+        price_difference_percent: indicator.price_difference_percent,
+        reach_type: indicator.reach_type || "new_reach", // 向后兼容
+      });
+    });
+  });
+
+  return flattened;
+};
+
+/**
+ * 按 reach_type 分组
+ * @param {Array} items - 达标股票数组
+ * @returns {Object} - { new_reach: [...], continuous_reach: [...] }
+ */
+const groupByReachType = (items) => {
+  if (!items || items.length === 0)
+    return { new_reach: [], continuous_reach: [] };
+  return items.reduce(
+    (acc, item) => {
+      const reachType = item.reach_type || "new_reach";
+      if (!acc[reachType]) {
+        acc[reachType] = [];
+      }
+      acc[reachType].push(item);
+      return acc;
+    },
+    { new_reach: [], continuous_reach: [] },
+  );
+};
+
 const DailyReport = () => {
   const [loading, setLoading] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [checkingTradingDay, setCheckingTradingDay] = useState(false); // 交易日检查状态
   const [snapshotStatus, setSnapshotStatus] = useState(null);
   const [report, setReport] = useState(null);
-  const [trendData, setTrendData] = useState(null);
   const [availableDates, setAvailableDates] = useState([]);
   const [tradingDays, setTradingDays] = useState([]); // 当前月份的交易日列表
   const [selectedDate, setSelectedDate] = useState(null);
@@ -108,11 +186,8 @@ const DailyReport = () => {
   const [nextDate, setNextDate] = useState(null);
   const [tradingDayInfo, setTradingDayInfo] = useState(null); // 交易日信息
   const [isNonTradingDay, setIsNonTradingDay] = useState(false); // 是否为非交易日
-
-  // 达标个股分页状态
-  const [reachedPage, setReachedPage] = useState(1);
-  const [reachedPageSize, setReachedPageSize] = useState(10);
-  const [reachedTotal, setReachedTotal] = useState(0);
+  const [chartModalVisible, setChartModalVisible] = useState(false); // 趋势图Modal
+  const [selectedSymbol, setSelectedSymbol] = useState(null); // 选中的股票
 
   // 加载快照日期列表
   const loadSnapshotDates = async () => {
@@ -172,7 +247,7 @@ const DailyReport = () => {
   };
 
   // 加载报告数据
-  const loadReport = async (targetDate = null, page = 1, pageSize = 10) => {
+  const loadReport = async (targetDate = null) => {
     setLoading(true);
     setIsNonTradingDay(false);
 
@@ -187,13 +262,8 @@ const DailyReport = () => {
       }
 
       const dateStr = targetDate ? targetDate.format("YYYY-MM-DD") : null;
-      const [reportData, trend] = await Promise.all([
-        stockApi.getDailyReport(dateStr, page, pageSize),
-        stockApi.getTrendData(7),
-      ]);
+      const reportData = await stockApi.getDailyReport(dateStr);
       setReport(reportData);
-      setTrendData(trend.data);
-      setReachedTotal(reportData.total_reached || 0);
 
       // 更新相邻日期
       if (targetDate) {
@@ -278,8 +348,7 @@ const DailyReport = () => {
       });
     } else {
       // 有快照，直接加载报告
-      setReachedPage(1); // 重置页码
-      loadReport(date, 1, reachedPageSize);
+      loadReport(date);
     }
   };
 
@@ -287,8 +356,7 @@ const DailyReport = () => {
   const handlePrevDate = () => {
     if (prevDate) {
       setSelectedDate(prevDate);
-      setReachedPage(1); // 重置页码
-      loadReport(prevDate, 1, reachedPageSize);
+      loadReport(prevDate);
     }
   };
 
@@ -296,22 +364,7 @@ const DailyReport = () => {
   const handleNextDate = () => {
     if (nextDate) {
       setSelectedDate(nextDate);
-      setReachedPage(1); // 重置页码
-      loadReport(nextDate, 1, reachedPageSize);
-    }
-  };
-
-  // 达标个股分页变化
-  const handleReachedPageChange = async (page, pageSize) => {
-    setReachedPage(page);
-    setReachedPageSize(pageSize);
-    const dateStr = selectedDate ? selectedDate.format("YYYY-MM-DD") : null;
-    try {
-      const reportData = await stockApi.getDailyReport(dateStr, page, pageSize);
-      setReport(reportData);
-      setReachedTotal(reportData.total_reached || 0);
-    } catch (error) {
-      message.error("加载数据失败: " + error.message);
+      loadReport(nextDate);
     }
   };
 
@@ -368,6 +421,12 @@ const DailyReport = () => {
     }
   };
 
+  // 显示趋势图Modal
+  const showChartModal = (symbol, name) => {
+    setSelectedSymbol({ symbol, name });
+    setChartModalVisible(true);
+  };
+
   useEffect(() => {
     const init = async () => {
       const dates = await loadSnapshotDates();
@@ -391,33 +450,121 @@ const DailyReport = () => {
     init();
   }, []);
 
-  // 渲染变化项
-  const renderChangeItem = (item, type) => {
-    const isRise = type === "reached";
-    const color = isRise ? "success" : "error";
-    const icon = isRise ? <RiseOutlined /> : <FallOutlined />;
+  // 渲染未达标股票（含 fall_type 分类）
+  const renderBelowStocksWithFallType = (items) => {
+    if (!items || items.length === 0) {
+      return (
+        <Empty
+          image={Empty.PRESENTED_IMAGE_SIMPLE}
+          description="无未达标股票"
+        />
+      );
+    }
+
+    // 按 MA 类型分组
+    const grouped = groupByMA(items);
+    const sortedKeys = getSortedGroupKeys(grouped);
+
+    return (
+      <Collapse defaultActiveKey={sortedKeys} ghost expandIconPosition="end">
+        {sortedKeys.map((maType) => {
+          const groupItems = sortBelowItemsByDeviation(grouped[maType]);
+          // 按 fall_type 分组
+          const { new_fall, continuous_below } = groupByFallType(groupItems);
+
+          return (
+            <Panel
+              key={maType}
+              header={
+                <Space>
+                  <Tag color="error">{maType}</Tag>
+                  <Text strong>{maType}</Text>
+                  <Text type="secondary">({groupItems.length}只)</Text>
+                </Space>
+              }
+            >
+              {/* 新跌破 - 红色 */}
+              {new_fall.length > 0 && (
+                <div style={{ marginBottom: 8 }}>
+                  <div
+                    style={{
+                      marginBottom: 4,
+                      fontWeight: "bold",
+                      color: "#ff4d4f",
+                    }}
+                  >
+                    🔴 新跌破 ({new_fall.length}只)
+                  </div>
+                  <List
+                    dataSource={new_fall}
+                    renderItem={(item) => renderBelowItem(item, "new_fall")}
+                    size="small"
+                  />
+                </div>
+              )}
+              {/* 持续未达标 - 黄色 */}
+              {continuous_below.length > 0 && (
+                <div>
+                  <div
+                    style={{
+                      marginBottom: 4,
+                      fontWeight: "bold",
+                      color: "#faad14",
+                    }}
+                  >
+                    🟡 持续未达标 ({continuous_below.length}只)
+                  </div>
+                  <List
+                    dataSource={continuous_below}
+                    renderItem={(item) =>
+                      renderBelowItem(item, "continuous_below")
+                    }
+                    size="small"
+                  />
+                </div>
+              )}
+            </Panel>
+          );
+        })}
+      </Collapse>
+    );
+  };
+
+  // 渲染单个未达标股票项
+  const renderBelowItem = (item, fallType) => {
+    const isNewFall = fallType === "new_fall";
+    const tagColor = isNewFall ? "error" : "warning";
 
     return (
       <List.Item>
         <List.Item.Meta
-          avatar={
-            <Tag color={color} icon={icon}>
-              {item.ma_type}
-            </Tag>
-          }
+          avatar={<Tag color={tagColor}>{item.ma_type}</Tag>}
           title={
             <Space>
-              <span style={{ fontWeight: "bold" }}>{item.symbol}</span>
-              <span style={{ color: "#8c8c8c" }}>{item.name}</span>
+              <span
+                style={{
+                  fontWeight: "bold",
+                  cursor: "pointer",
+                  color: "#1890ff",
+                }}
+                onClick={() => showChartModal(item.symbol, item.name)}
+              >
+                {item.symbol}
+              </span>
+              <span
+                style={{ color: "#8c8c8c", cursor: "pointer" }}
+                onClick={() => showChartModal(item.symbol, item.name)}
+              >
+                {item.name}
+              </span>
             </Space>
           }
           description={
             <Space split={<Divider type="vertical" />}>
               <span>现价: ¥{item.current_price?.toFixed(2)}</span>
               <span>均线: ¥{item.ma_price?.toFixed(2)}</span>
-              <span style={{ color: isRise ? "#52c41a" : "#ff4d4f" }}>
-                偏离: {item.price_difference_percent > 0 ? "+" : ""}
-                {item.price_difference_percent?.toFixed(2)}%
+              <span style={{ color: "#ff4d4f" }}>
+                偏离: {item.price_difference_percent?.toFixed(2)}%
               </span>
             </Space>
           }
@@ -426,159 +573,126 @@ const DailyReport = () => {
     );
   };
 
-  // 渲染 MA 分组折叠面板
-  const renderMACollapsePanel = (items, type) => {
-    const isRise = type === "reached";
-    const grouped = groupByMA(items);
-    const sortedKeys = getSortedGroupKeys(grouped);
+  // 渲染单个达标股票项
+  const renderReachedItem = (item, reachType) => {
+    const isNewReach = reachType === "new_reach";
+    const tagColor = isNewReach ? "success" : "#b7eb8f"; // 亮绿 vs 淡绿
 
-    if (sortedKeys.length === 0) {
-      return (
-        <Empty
-          image={Empty.PRESENTED_IMAGE_SIMPLE}
-          description={isRise ? "无新增达标" : "无跌破均线"}
+    return (
+      <List.Item>
+        <List.Item.Meta
+          avatar={<Tag color={tagColor}>{item.ma_type}</Tag>}
+          title={
+            <Space>
+              <span
+                style={{
+                  fontWeight: "bold",
+                  cursor: "pointer",
+                  color: "#1890ff",
+                }}
+                onClick={() => showChartModal(item.symbol, item.name)}
+              >
+                {item.symbol}
+              </span>
+              <span
+                style={{ color: "#8c8c8c", cursor: "pointer" }}
+                onClick={() => showChartModal(item.symbol, item.name)}
+              >
+                {item.name}
+              </span>
+            </Space>
+          }
+          description={
+            <Space split={<Divider type="vertical" />}>
+              <span>现价: ¥{item.current_price?.toFixed(2)}</span>
+              <span>均线: ¥{item.ma_price?.toFixed(2)}</span>
+              <span style={{ color: "#52c41a" }}>
+                偏离: +{item.price_difference_percent?.toFixed(2)}%
+              </span>
+            </Space>
+          }
         />
+      </List.Item>
+    );
+  };
+
+  // 渲染达标股票（含 reach_type 分类）
+  const renderReachedStocksWithReachType = (reachedStocks) => {
+    if (!reachedStocks || reachedStocks.length === 0) {
+      return (
+        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="无达标股票" />
       );
     }
+
+    // 展平数据：将聚合的 reached_stocks 转换为扁平数组
+    const flattened = flattenReachedStocks(reachedStocks);
+
+    // 按 MA 类型分组
+    const grouped = groupByMA(flattened);
+    const sortedKeys = getSortedGroupKeys(grouped);
 
     return (
       <Collapse defaultActiveKey={sortedKeys} ghost expandIconPosition="end">
         {sortedKeys.map((maType) => {
           const groupItems = sortItemsByDeviation(grouped[maType]);
+          // 按 reach_type 分组
+          const { new_reach, continuous_reach } = groupByReachType(groupItems);
+
           return (
             <Panel
               key={maType}
               header={
                 <Space>
-                  <Tag color={isRise ? "success" : "error"}>{maType}</Tag>
+                  <Tag color="success">{maType}</Tag>
                   <Text strong>{maType}</Text>
                   <Text type="secondary">({groupItems.length}只)</Text>
                 </Space>
               }
             >
-              <List
-                dataSource={groupItems}
-                renderItem={(item) => renderChangeItem(item, type)}
-                size="small"
-              />
+              {/* 新增达标 - 亮绿色 */}
+              {new_reach.length > 0 && (
+                <div style={{ marginBottom: 8 }}>
+                  <div
+                    style={{
+                      marginBottom: 4,
+                      fontWeight: "bold",
+                      color: "#52c41a",
+                    }}
+                  >
+                    🟢 新增达标 ({new_reach.length}只)
+                  </div>
+                  <List
+                    dataSource={new_reach}
+                    renderItem={(item) => renderReachedItem(item, "new_reach")}
+                    size="small"
+                  />
+                </div>
+              )}
+              {/* 持续达标 - 淡绿色 */}
+              {continuous_reach.length > 0 && (
+                <div>
+                  <div
+                    style={{
+                      marginBottom: 4,
+                      fontWeight: "bold",
+                      color: "#73d13d",
+                    }}
+                  >
+                    🟢 持续达标 ({continuous_reach.length}只)
+                  </div>
+                  <List
+                    dataSource={continuous_reach}
+                    renderItem={(item) =>
+                      renderReachedItem(item, "continuous_reach")
+                    }
+                    size="small"
+                  />
+                </div>
+              )}
             </Panel>
           );
         })}
       </Collapse>
-    );
-  };
-
-  // 简单的趋势图（使用 ASCII 艺术风格）
-  const renderTrendChart = () => {
-    if (!trendData || trendData.length === 0) {
-      return <Empty description="暂无趋势数据" />;
-    }
-
-    const maxCount = Math.max(...trendData.map((d) => d.reached_count), 1);
-    const chartHeight = 8;
-
-    return (
-      <div
-        style={{
-          background: "#fafafa",
-          padding: "16px",
-          borderRadius: "8px",
-          overflow: "auto",
-        }}
-      >
-        {/* Y轴刻度 */}
-        <div style={{ display: "flex", marginBottom: "8px" }}>
-          <div
-            style={{
-              width: "40px",
-              display: "flex",
-              flexDirection: "column",
-              justifyContent: "space-between",
-              height: `${chartHeight * 10}px`,
-              color: "#8c8c8c",
-              fontSize: "12px",
-            }}
-          >
-            <span>{maxCount}</span>
-            <span>{Math.round(maxCount / 2)}</span>
-            <span>0</span>
-          </div>
-
-          {/* 柱状图区域 */}
-          <div
-            style={{
-              display: "flex",
-              gap: "8px",
-              flex: 1,
-              alignItems: "flex-end",
-            }}
-          >
-            {trendData.map((item, index) => {
-              const heightPercent = (item.reached_count / maxCount) * 100;
-              return (
-                <div
-                  key={index}
-                  style={{
-                    display: "flex",
-                    flexDirection: "column",
-                    alignItems: "center",
-                    flex: 1,
-                  }}
-                >
-                  <div
-                    style={{
-                      width: "100%",
-                      maxWidth: "40px",
-                      height: `${chartHeight * 10}px`,
-                      display: "flex",
-                      alignItems: "flex-end",
-                    }}
-                  >
-                    <div
-                      style={{
-                        width: "100%",
-                        height: `${heightPercent}%`,
-                        background:
-                          index === trendData.length - 1
-                            ? "#1890ff"
-                            : "#91d5ff",
-                        borderRadius: "4px 4px 0 0",
-                        transition: "height 0.3s",
-                        display: "flex",
-                        alignItems: "flex-start",
-                        justifyContent: "center",
-                        color: "#fff",
-                        fontSize: "12px",
-                        fontWeight: "bold",
-                        paddingTop: "4px",
-                      }}
-                    >
-                      {item.reached_count}
-                    </div>
-                  </div>
-                  <div
-                    style={{
-                      fontSize: "11px",
-                      color: "#8c8c8c",
-                      marginTop: "4px",
-                    }}
-                  >
-                    {item.date}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-
-        {/* 达标率 */}
-        <div style={{ marginTop: "16px", textAlign: "center" }}>
-          <Text type="secondary">
-            近 {trendData.length} 日达标趋势 · 达标率{" "}
-            {trendData[trendData.length - 1]?.reached_rate || 0}%
-          </Text>
-        </div>
-      </div>
     );
   };
 
@@ -705,92 +819,6 @@ const DailyReport = () => {
         <Spin spinning={loading}>
           {report ? (
             <>
-              {/* 概览卡片 */}
-              <Row gutter={16} style={{ marginBottom: 24 }}>
-                <Col xs={12} sm={6}>
-                  <Card>
-                    <Statistic
-                      title="监控总数"
-                      value={report.summary.total_stocks}
-                      suffix="只"
-                    />
-                  </Card>
-                </Col>
-                <Col xs={12} sm={6}>
-                  <Card>
-                    <Statistic
-                      title="今日达标"
-                      value={report.summary.reached_count}
-                      valueStyle={{ color: "#52c41a" }}
-                      suffix={
-                        <span style={{ fontSize: "14px", color: "#8c8c8c" }}>
-                          / {report.summary.total_stocks}
-                        </span>
-                      }
-                    />
-                  </Card>
-                </Col>
-                <Col xs={12} sm={6}>
-                  <Card>
-                    <Statistic
-                      title="新增达标"
-                      value={report.summary.newly_reached}
-                      valueStyle={{ color: "#1890ff" }}
-                      prefix={<RiseOutlined />}
-                    />
-                  </Card>
-                </Col>
-                <Col xs={12} sm={6}>
-                  <Card>
-                    <Statistic
-                      title="跌破均线"
-                      value={report.summary.newly_below}
-                      valueStyle={{ color: "#ff4d4f" }}
-                      prefix={<FallOutlined />}
-                    />
-                  </Card>
-                </Col>
-              </Row>
-
-              {/* 达标率 */}
-              <Card style={{ marginBottom: 24 }}>
-                <Row gutter={16} align="middle">
-                  <Col span={12}>
-                    <Statistic
-                      title="达标率"
-                      value={report.summary.reached_rate}
-                      precision={1}
-                      suffix="%"
-                    />
-                  </Col>
-                  <Col span={12}>
-                    {report.has_yesterday ? (
-                      <Statistic
-                        title="较昨日变化"
-                        value={Math.abs(report.summary.reached_rate_change)}
-                        precision={1}
-                        suffix="%"
-                        valueStyle={{
-                          color:
-                            report.summary.reached_rate_change >= 0
-                              ? "#52c41a"
-                              : "#ff4d4f",
-                        }}
-                        prefix={
-                          report.summary.reached_rate_change >= 0 ? (
-                            <RiseOutlined />
-                          ) : (
-                            <FallOutlined />
-                          )
-                        }
-                      />
-                    ) : (
-                      <Text type="secondary">暂无昨日数据对比</Text>
-                    )}
-                  </Col>
-                </Row>
-              </Card>
-
               {/* 变化列表 */}
               <Row gutter={16} style={{ marginBottom: 24 }}>
                 <Col xs={24} lg={12}>
@@ -798,13 +826,17 @@ const DailyReport = () => {
                     title={
                       <Space>
                         <RiseOutlined style={{ color: "#52c41a" }} />
-                        <span>新增达标</span>
-                        <Tag color="success">{report.newly_reached.length}</Tag>
+                        <span>达标个股</span>
+                        <Tag color="success">
+                          {report.reached_stocks?.length || 0}
+                        </Tag>
                       </Space>
                     }
                     size="small"
                   >
-                    {renderMACollapsePanel(report.newly_reached, "reached")}
+                    {renderReachedStocksWithReachType(
+                      report.reached_stocks || [],
+                    )}
                   </Card>
                 </Col>
                 <Col xs={24} lg={12}>
@@ -812,113 +844,20 @@ const DailyReport = () => {
                     title={
                       <Space>
                         <FallOutlined style={{ color: "#ff4d4f" }} />
-                        <span>跌破均线</span>
-                        <Tag color="error">{report.newly_below.length}</Tag>
+                        <span>未达标个股</span>
+                        <Tag color="error">
+                          {report.all_below_stocks?.length || 0}
+                        </Tag>
                       </Space>
                     }
                     size="small"
                   >
-                    {renderMACollapsePanel(report.newly_below, "below")}
+                    {renderBelowStocksWithFallType(
+                      report.all_below_stocks || [],
+                    )}
                   </Card>
                 </Col>
               </Row>
-
-              {/* 今日达标个股 */}
-              <Card
-                title={
-                  <Space>
-                    <span>今日达标个股</span>
-                    <Tag color="success">{reachedTotal}只</Tag>
-                  </Space>
-                }
-                style={{ marginBottom: 24 }}
-              >
-                {report.reached_stocks && report.reached_stocks.length > 0 ? (
-                  <>
-                    <Table
-                      dataSource={report.reached_stocks}
-                      rowKey="stock_id"
-                      pagination={false}
-                      size="small"
-                      columns={[
-                        {
-                          title: "代码",
-                          dataIndex: "symbol",
-                          key: "symbol",
-                          width: 100,
-                          render: (text) => (
-                            <span style={{ fontWeight: "bold" }}>{text}</span>
-                          ),
-                        },
-                        {
-                          title: "名称",
-                          dataIndex: "name",
-                          key: "name",
-                          width: 120,
-                          render: (text) => (
-                            <span style={{ color: "#8c8c8c" }}>{text}</span>
-                          ),
-                        },
-                        {
-                          title: "达标指标",
-                          dataIndex: "reached_indicators",
-                          key: "reached_indicators",
-                          render: (indicators) => (
-                            <Space size={4}>
-                              {indicators.map((ind, idx) => (
-                                <Tag key={idx} color="success">
-                                  {ind.ma_type}
-                                </Tag>
-                              ))}
-                            </Space>
-                          ),
-                        },
-                        {
-                          title: "现价",
-                          dataIndex: "current_price",
-                          key: "current_price",
-                          width: 100,
-                          render: (price) => `¥${price?.toFixed(2)}`,
-                        },
-                        {
-                          title: "最大偏离",
-                          dataIndex: "max_deviation_percent",
-                          key: "max_deviation_percent",
-                          width: 100,
-                          render: (percent) => (
-                            <span
-                              style={{ color: "#52c41a", fontWeight: "bold" }}
-                            >
-                              +{percent?.toFixed(2)}%
-                            </span>
-                          ),
-                        },
-                      ]}
-                    />
-                    {reachedTotal > reachedPageSize && (
-                      <div style={{ marginTop: 16, textAlign: "right" }}>
-                        <Pagination
-                          current={reachedPage}
-                          pageSize={reachedPageSize}
-                          total={reachedTotal}
-                          onChange={handleReachedPageChange}
-                          showSizeChanger
-                          showTotal={(total) => `共 ${total} 条`}
-                          pageSizeOptions={["10", "20", "50"]}
-                        />
-                      </div>
-                    )}
-                  </>
-                ) : (
-                  <Empty
-                    image={Empty.PRESENTED_IMAGE_SIMPLE}
-                    description="暂无达标个股"
-                  />
-                )}
-              </Card>
-
-              {/* 趋势图表 */}
-              <Card title="近 7 日趋势">{renderTrendChart()}</Card>
             </>
           ) : isNonTradingDay ? (
             /* 非交易日友好提示 */
@@ -955,6 +894,31 @@ const DailyReport = () => {
           )}
         </Spin>
       </Card>
+
+      {/* 趋势图Modal */}
+      <Modal
+        title={
+          selectedSymbol
+            ? `${selectedSymbol.name} (${selectedSymbol.symbol}) 趋势图`
+            : "趋势图"
+        }
+        open={chartModalVisible}
+        onCancel={() => {
+          setChartModalVisible(false);
+          setSelectedSymbol(null);
+        }}
+        footer={null}
+        width={650}
+        centered
+        destroyOnClose
+      >
+        {selectedSymbol && (
+          <StockChart
+            symbol={selectedSymbol.symbol}
+            name={selectedSymbol.name}
+          />
+        )}
+      </Modal>
     </div>
   );
 };

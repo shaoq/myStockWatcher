@@ -1,5 +1,4 @@
-"""业务逻辑服务层 - 已升级为实时行情+动态均线计算 + 缓存优化 + 交易时间智能缓存 + 并发优化"""
-import requests
+"""业务逻辑服务层 - 多数据源支持 + 智能缓存 + 交易时间判断"""
 import json
 import re
 import logging
@@ -12,6 +11,9 @@ from .models import Stock
 from datetime import datetime, date, timezone, timedelta
 from zoneinfo import ZoneInfo
 from cachetools import TTLCache
+
+# 导入数据源协调器
+from .providers import get_coordinator
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
@@ -39,6 +41,30 @@ name_cache = TTLCache(maxsize=500, ttl=86400)
 _trading_calendar_lock = threading.Lock()
 # 正在刷新的年份集合
 _refreshing_years = set()
+
+
+def clear_all_caches() -> Dict[str, int]:
+    """
+    清理所有内存缓存
+
+    Returns:
+        Dict[str, int]: 各缓存的清理数量
+    """
+    kline_count = len(kline_cache)
+    price_count = len(price_cache)
+    name_count = len(name_cache)
+
+    kline_cache.clear()
+    price_cache.clear()
+    name_cache.clear()
+
+    logger.info(f"[缓存清理] 已清理 K线缓存: {kline_count} 条, 价格缓存: {price_count} 条, 名称缓存: {name_count} 条")
+
+    return {
+        "kline_cache": kline_count,
+        "price_cache": price_count,
+        "name_cache": name_count
+    }
 
 
 # ============ 交易时间判断 ============
@@ -413,7 +439,7 @@ def is_trading_day(db=None, target_date: date = None) -> Tuple[bool, str]:
 
 def fetch_historical_kline_data(symbol: str, target_date: date, ma_types: List[str] = None) -> Tuple[Optional[float], Optional[Dict]]:
     """
-    获取历史 K 线数据，用于生成历史快照
+    获取历史 K 线数据，用于生成历史快照（使用多数据源协调器）
 
     Args:
         symbol: 股票代码
@@ -428,7 +454,7 @@ def fetch_historical_kline_data(symbol: str, target_date: date, ma_types: List[s
     if ma_types is None:
         ma_types = ["MA5"]
 
-    code, market = normalize_symbol_for_sina(symbol)
+    normalized_code, market = normalize_symbol_for_sina(symbol)
 
     # 计算 K 线数据长度（取最大 MA 周期 + 额外天数以确保覆盖目标日期）
     max_ma_period = 5  # 默认值
@@ -440,25 +466,18 @@ def fetch_historical_kline_data(symbol: str, target_date: date, ma_types: List[s
     # 获取足够的 K 线数据（目标日期前后各取一些）
     datalen = max_ma_period + 30  # 多取一些确保有目标日期的数据
 
-    if market == "cn":
-        url = f"http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol={code}&scale=240&ma=no&datalen={datalen}"
-    else:
-        url = f"https://stock.finance.sina.com.cn/usstock/api/jsonp.php/IO.Direct.Quotes.getKLineData?symbol={code}&scale=240&ma=no&datalen={datalen}"
+    # 使用数据源协调器获取 K 线数据
+    coordinator = get_coordinator()
+    kline_data, provider_name, tried_providers = coordinator.get_kline_data(
+        symbol, normalized_code, market, datalen
+    )
 
-    response, _ = _http_get(url, "历史K线数据", symbol=symbol)
-
-    if response is None:
-        logger.warning(f"[历史K线数据] 获取失败 | 股票: {symbol} | 日期: {target_date}")
+    if kline_data is None:
+        logger.warning(f"[历史K线数据] 获取失败 | 股票: {symbol} | 日期: {target_date} | 尝试过: {tried_providers}")
         return None, None
 
     try:
-        if market == "us":
-            match = re.search(r'\[.*\]', response.text)
-            data = json.loads(match.group()) if match else []
-        else:
-            data = response.json()
-
-        if not data or not isinstance(data, list):
+        if not kline_data or not isinstance(kline_data, list):
             logger.warning(f"[历史K线数据] 数据为空 | 股票: {symbol}")
             return None, None
 
@@ -467,7 +486,7 @@ def fetch_historical_kline_data(symbol: str, target_date: date, ma_types: List[s
         target_kline = None
         target_index = -1
 
-        for i, item in enumerate(data):
+        for i, item in enumerate(kline_data):
             kline_date = item.get('day', '').split(' ')[0]
             if kline_date == target_date_str:
                 target_kline = item
@@ -495,7 +514,7 @@ def fetch_historical_kline_data(symbol: str, target_date: date, ma_types: List[s
             # 计算该日期的 MA（使用目标日期及之前的收盘价）
             closes = []
             for j in range(max(0, target_index - ma_period + 1), target_index + 1):
-                closes.append(float(data[j].get('close', 0)))
+                closes.append(float(kline_data[j].get('close', 0)))
 
             if len(closes) >= ma_period and all(c > 0 for c in closes):
                 ma_val = round(sum(closes) / ma_period, 2)
@@ -508,7 +527,7 @@ def fetch_historical_kline_data(symbol: str, target_date: date, ma_types: List[s
                 }
                 logger.debug(f"[历史K线数据] {ma_type}: {ma_val} | 收盘价: {close_price} | 股票: {symbol}")
 
-        logger.info(f"[历史K线数据] 获取成功 | 股票: {symbol} | 日期: {target_date} | 收盘价: {close_price} | MA数量: {len(ma_results)}")
+        logger.info(f"[历史K线数据] 获取成功 | 股票: {symbol} | 日期: {target_date} | 数据源: {provider_name} | 收盘价: {close_price} | MA数量: {len(ma_results)}")
 
         return close_price, ma_results
 
@@ -593,50 +612,6 @@ def should_refresh_price(stock: Stock, market: str, db = None, need_calc: bool =
 
     return False, f"数据已是最新收盘数据，更新于: {last_update.astimezone(beijing_tz).strftime('%Y-%m-%d %H:%M')}"
 
-# 创建一个带有 User-Agent 的 session
-session = requests.Session()
-session.headers.update({
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-})
-
-
-def _http_get(url: str, service_name: str, headers: dict = None, timeout: int = 5, symbol: str = None) -> Tuple[Optional[requests.Response], float]:
-    """
-    统一的 HTTP GET 请求方法，带日志记录
-
-    Args:
-        url: 请求 URL
-        service_name: 服务名称（用于日志标识）
-        headers: 请求头
-        timeout: 超时时间（秒）
-        symbol: 股票代码（可选，用于日志）
-
-    Returns:
-        Tuple[Optional[Response], float]: (响应对象, 耗时毫秒)
-    """
-    start_time = time.time()
-    symbol_info = f" | 股票: {symbol}" if symbol else ""
-
-    try:
-        logger.info(f"[{service_name}] 请求开始{symbol_info} | URL: {url}")
-        response = session.get(url, headers=headers or {}, timeout=timeout)
-        elapsed_ms = (time.time() - start_time) * 1000
-
-        if response.status_code == 200:
-            logger.info(f"[{service_name}] 请求成功{symbol_info} | 状态码: {response.status_code} | 耗时: {elapsed_ms:.0f}ms")
-        else:
-            logger.warning(f"[{service_name}] 请求失败{symbol_info} | 状态码: {response.status_code} | 耗时: {elapsed_ms:.0f}ms | URL: {url}")
-
-        return response, elapsed_ms
-    except requests.exceptions.Timeout:
-        elapsed_ms = (time.time() - start_time) * 1000
-        logger.error(f"[{service_name}] 请求超时{symbol_info} | 耗时: {elapsed_ms:.0f}ms | URL: {url}")
-        return None, elapsed_ms
-    except requests.exceptions.RequestException as e:
-        elapsed_ms = (time.time() - start_time) * 1000
-        logger.error(f"[{service_name}] 请求异常{symbol_info} | 耗时: {elapsed_ms:.0f}ms | 错误: {e} | URL: {url}")
-        return None, elapsed_ms
-
 
 def normalize_symbol_for_sina(symbol: str) -> Tuple[str, str]:
     """为新浪接口规范化代码并识别市场类型 (cn/us)"""
@@ -662,124 +637,48 @@ def normalize_symbol_for_sina(symbol: str) -> Tuple[str, str]:
     return symbol, "us"
 
 
-def fetch_realtime_data(symbol: str, use_cache: bool = True) -> Tuple[Optional[float], Optional[str]]:
-    """获取实时价格和股票名称（带缓存）"""
-    # 检查缓存
-    if use_cache and symbol in price_cache:
-        logger.info(f"[新浪实时行情] 缓存命中 | 股票: {symbol}")
+def fetch_realtime_data(symbol: str, use_cache: bool = True, is_trading_time: bool = False) -> Tuple[Optional[float], Optional[str]]:
+    """
+    获取实时价格和股票名称（使用多数据源协调器）
+
+    Args:
+        symbol: 股票代码
+        use_cache: 是否使用缓存（非交易时间使用）
+        is_trading_time: 是否在交易时间内（交易时间内不缓存价格数据）
+
+    Returns:
+        Tuple[Optional[float], Optional[str]]: (价格, 名称)
+    """
+    # 交易时间内不使用缓存，确保数据实时性
+    if use_cache and not is_trading_time and symbol in price_cache:
+        logger.info(f"[实时行情] 缓存命中 | 股票: {symbol}")
         return price_cache[symbol]
 
-    code, market = normalize_symbol_for_sina(symbol)
-    url = f"http://hq.sinajs.cn/list={code if market == 'cn' else 'gb_' + code.lower()}"
-    headers = {'Referer': 'http://finance.sina.com.cn'}
+    # 使用数据源协调器获取数据
+    coordinator = get_coordinator()
+    normalized_code, market = normalize_symbol_for_sina(symbol)
 
-    response, elapsed_ms = _http_get(url, "新浪实时行情", headers, symbol=symbol)
+    result = coordinator.get_realtime_price(symbol, normalized_code, market)
 
-    if response is None:
-        logger.warning(f"[新浪实时行情] 获取失败 | 股票: {symbol}")
-        return None, None
+    if result.success and result.data:
+        price = result.data.current_price
+        name = result.data.name
 
-    try:
-        match = re.search(r'="([^"]+)"', response.text)
-        if match:
-            data = match.group(1).split(',')
-            if market == "cn" and len(data) > 3:
-                price, name = float(data[3]), data[0]
-                # 【修复】价格为 0 表示无效数据（停牌、退市等），返回 None
-                if price <= 0:
-                    logger.warning(f"[新浪实时行情] 价格无效 | 股票: {symbol} | 价格: {price} | 耗时: {elapsed_ms:.0f}ms")
-                    return None, None
-                # 存入缓存
-                price_cache[symbol] = (price, name)
-                logger.info(f"[新浪实时行情] 解析成功 | 股票: {symbol} | 名称: {name} | 价格: {price} | 耗时: {elapsed_ms:.0f}ms")
-                return price, name
-            elif market == "us" and len(data) > 1:
-                price, name = float(data[1]), data[0]
-                # 【修复】价格为 0 表示无效数据
-                if price <= 0:
-                    logger.warning(f"[新浪实时行情] 价格无效 | 股票: {symbol} | 价格: {price} | 耗时: {elapsed_ms:.0f}ms")
-                    return None, None
-                # 存入缓存
-                price_cache[symbol] = (price, name)
-                logger.info(f"[新浪实时行情] 解析成功 | 股票: {symbol} | 名称: {name} | 价格: {price} | 耗时: {elapsed_ms:.0f}ms")
-                return price, name
-        logger.warning(f"[新浪实时行情] 解析失败 | 股票: {symbol} | 响应内容异常 | 耗时: {elapsed_ms:.0f}ms")
-        return None, None
-    except Exception as e:
-        logger.error(f"[新浪实时行情] 解析异常 | 股票: {symbol} | 错误: {e}")
-        return None, None
+        # 非交易时间缓存数据
+        if not is_trading_time:
+            price_cache[symbol] = (price, name)
+
+        logger.info(f"[实时行情] 获取成功 | 股票: {symbol} | 数据源: {result.provider_name} | 名称: {name} | 价格: {price}")
+        return price, name
+
+    logger.warning(f"[实时行情] 获取失败 | 股票: {symbol} | 尝试过: {result.tried_providers}")
+    return None, None
 
 
 def fetch_stock_name(symbol: str) -> Optional[str]:
     """获取股票中文名称"""
     _, name = fetch_realtime_data(symbol)
     return name
-
-
-def fetch_stock_data_from_api(symbol: str, ma_type: str = "MA5", current_price: Optional[float] = None) -> Tuple[Optional[float], Optional[float]]:
-    """
-    获取实时价格并动态计算包含今日数据的均线值
-    current_price: 可选，如果已获取过实时价格可直接传入，避免重复请求
-    """
-    code, market = normalize_symbol_for_sina(symbol)
-
-    # 安全提取 MA 周期数字
-    match = re.search(r'\d+', ma_type)
-    if not match:
-        logger.warning(f"[新浪K线数据] 无效的指标格式: {ma_type} | 股票: {symbol}，使用默认值 5")
-        ma_period = 5
-    else:
-        ma_period = int(match.group())
-
-    # 1. 获取今日实时价格（如果未提供）
-    if current_price is None:
-        current_price, _ = fetch_realtime_data(symbol)
-        if current_price is None:
-            return None, None
-
-    # 2. 获取历史 K 线数据以计算均线
-    datalen = ma_period + 2
-    if market == "cn":
-        url = f"http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol={code}&scale=240&ma=no&datalen={datalen}"
-    else:
-        url = f"https://stock.finance.sina.com.cn/usstock/api/jsonp.php/IO.Direct.Quotes.getKLineData?symbol={code}&scale=240&ma=no&datalen={datalen}"
-
-    response, _ = _http_get(url, "新浪K线数据", symbol=symbol)
-
-    if response is None:
-        return current_price, None
-
-    try:
-        if market == "us":
-            match = re.search(r'\[.*\]', response.text)
-            data = json.loads(match.group()) if match else []
-        else:
-            data = response.json()
-
-        if not data or not isinstance(data, list):
-            logger.warning(f"[新浪K线数据] 数据为空 | 股票: {symbol}")
-            return current_price, None
-
-        # 提取收盘价序列
-        closes = [float(item['close']) for item in data]
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        last_day = data[-1]['day'].split(' ')[0]
-
-        if last_day == today_str:
-            final_closes = closes[-ma_period:]
-        else:
-            final_closes = closes[-(ma_period-1):] + [current_price]
-
-        if len(final_closes) < ma_period:
-            return current_price, None
-
-        ma_price = round(sum(final_closes) / ma_period, 2)
-        logger.info(f"[新浪K线数据] MA计算成功 | 股票: {symbol} | {ma_type}: {ma_price} | 数据点数: {len(final_closes)}")
-        return current_price, ma_price
-
-    except Exception as e:
-        logger.error(f"[新浪K线数据] 解析异常 | 股票: {symbol} | 错误: {e}")
-        return current_price, None
 
 
 def get_stock_chart_urls(symbol: str) -> Dict[str, str]:
@@ -829,6 +728,7 @@ def enrich_stock_with_status(stock: Stock, force_refresh: bool = False, db = Non
     need_fetch_data = False
     is_realtime = False
     refresh_reason = ""
+    data_fetched_at = None  # 数据获取时间
 
     if force_refresh:
         need_fetch_data = True
@@ -861,17 +761,24 @@ def enrich_stock_with_status(stock: Stock, force_refresh: bool = False, db = Non
     # 根据智能缓存决策获取数据
     if need_fetch_data:
         # 【获取数据模式】请求 API 获取最新数据
-        current_price, _ = fetch_realtime_data(stock.symbol, use_cache=False)
+        # 交易时间内不缓存，确保数据实时性
+        current_price, _ = fetch_realtime_data(stock.symbol, use_cache=False, is_trading_time=is_realtime)
+        # 记录数据获取时间
+        data_fetched_at = datetime.now(ZoneInfo("Asia/Shanghai"))
     else:
         # 【缓存模式】使用数据库中已有的价格
         current_price = stock.current_price
+        # 缓存模式下，使用数据库的 updated_at 作为数据获取时间
+        data_fetched_at = stock.updated_at
 
         # 【修复】如果缓存价格为 None 或 0，强制重新获取
         if current_price is None or current_price <= 0:
             logger.warning(f"[智能缓存] 缓存价格无效，强制刷新 | 股票: {stock.symbol} | 缓存价格: {current_price}")
-            current_price, _ = fetch_realtime_data(stock.symbol, use_cache=False)
+            current_price, _ = fetch_realtime_data(stock.symbol, use_cache=False, is_trading_time=is_realtime)
             # 只有在真正的交易时间内才标记为实时（交易日 + 交易时间段）
             is_realtime = is_real_trading_time(market, db=db)
+            # 重新获取数据后，更新获取时间
+            data_fetched_at = datetime.now(ZoneInfo("Asia/Shanghai"))
         else:
             logger.info(f"[智能缓存] 使用缓存数据 | 股票: {stock.symbol} | 价格: {current_price}")
 
@@ -888,7 +795,7 @@ def enrich_stock_with_status(stock: Stock, force_refresh: bool = False, db = Non
     # 如果没有有效的周期，使用默认值 5
     max_ma_period = max(ma_periods) if ma_periods else 5
 
-    code, _ = normalize_symbol_for_sina(stock.symbol)
+    normalized_code, _ = normalize_symbol_for_sina(stock.symbol)
     kline_closes = None
 
     # K线缓存键：股票代码:日期:最大周期（确保不同指标组合使用独立缓存）
@@ -896,46 +803,41 @@ def enrich_stock_with_status(stock: Stock, force_refresh: bool = False, db = Non
 
     # 检查 K 线缓存（仅在非实时模式下使用缓存）
     if not is_realtime and cache_key in kline_cache:
-        logger.info(f"[新浪K线数据] 缓存命中 | 股票: {stock.symbol} | 周期: {max_ma_period}")
+        logger.info(f"[K线数据] 缓存命中 | 股票: {stock.symbol} | 周期: {max_ma_period}")
         kline_closes = kline_cache[cache_key]
     else:
-        # 缓存未命中或实时模式，请求 API
+        # 缓存未命中或实时模式，使用协调器请求 API
         datalen = max_ma_period + 2
-        if market == "cn":
-            url = f"http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol={code}&scale=240&ma=no&datalen={datalen}"
-        else:
-            url = f"https://stock.finance.sina.com.cn/usstock/api/jsonp.php/IO.Direct.Quotes.getKLineData?symbol={code}&scale=240&ma=no&datalen={datalen}"
+        coordinator = get_coordinator()
+        kline_data, provider_name, tried_providers = coordinator.get_kline_data(
+            stock.symbol, normalized_code, market, datalen
+        )
 
-        response, kline_elapsed = _http_get(url, "新浪K线数据", symbol=stock.symbol)
-
-        if response:
+        if kline_data:
             try:
-                if market == "us":
-                    match = re.search(r'\[.*\]', response.text)
-                    data = json.loads(match.group()) if match else []
-                else:
-                    data = response.json()
+                # 【修复】过滤无效的 close 值，避免 None 或空字符串导致后续计算错误
+                kline_closes = []
+                for item in kline_data:
+                    close_val = item.get('close')
+                    if close_val is not None and close_val != '' and close_val != 0:
+                        try:
+                            kline_closes.append(float(close_val))
+                        except (ValueError, TypeError):
+                            pass  # 跳过无效数据
 
-                if data and isinstance(data, list):
-                    # 【修复】过滤无效的 close 值，避免 None 或空字符串导致后续计算错误
-                    kline_closes = []
-                    for item in data:
-                        close_val = item.get('close')
-                        if close_val is not None and close_val != '' and close_val != 0:
-                            try:
-                                kline_closes.append(float(close_val))
-                            except (ValueError, TypeError):
-                                pass  # 跳过无效数据
-                    today_str = datetime.now().strftime("%Y-%m-%d")
-                    last_day = data[-1].get('day', '').split(' ')[0] if data else ''
-                    if last_day != today_str and current_price is not None:
-                        kline_closes.append(current_price)
-                    # 存入缓存（仅当有有效数据时）
-                    if kline_closes:
-                        kline_cache[cache_key] = kline_closes
-                    logger.info(f"[新浪K线数据] 获取成功 | 股票: {stock.symbol} | K线数量: {len(kline_closes)} | 耗时: {kline_elapsed:.0f}ms")
+                # 【修正】根据交易时间决定是否加入实时价格到 MA 计算
+                # 交易时间内：加入实时价格，MA 动态计算
+                # 非交易时间：只用历史 K 线收盘价
+                if is_realtime and current_price is not None and current_price > 0:
+                    kline_closes.append(current_price)
+                    logger.info(f"[MA计算] 交易时间内，实时价格加入MA计算 | 股票: {stock.symbol} | 实时价格: {current_price}")
+
+                # 存入缓存（仅当有有效数据且非实时模式时）
+                if kline_closes and not is_realtime:
+                    kline_cache[cache_key] = kline_closes
+                logger.info(f"[K线数据] 获取成功 | 股票: {stock.symbol} | 数据源: {provider_name} | K线数量: {len(kline_closes)}")
             except Exception as e:
-                logger.error(f"[新浪K线数据] 解析异常 | 股票: {stock.symbol} | 错误: {e}")
+                logger.error(f"[K线数据] 解析异常 | 股票: {stock.symbol} | 错误: {e}")
 
     # 【新增】如果实时价格获取失败（停牌、退市等），使用 K 线历史数据的最后收盘价
     if current_price is None and kline_closes and len(kline_closes) > 0:
@@ -994,7 +896,8 @@ def enrich_stock_with_status(stock: Stock, force_refresh: bool = False, db = Non
         reached_target=main_res.reached_target if main_res else False,
         price_difference=main_res.price_difference if main_res else None,
         price_difference_percent=main_res.price_difference_percent if main_res else None,
-        is_realtime=is_realtime
+        is_realtime=is_realtime,
+        data_fetched_at=data_fetched_at
     )
 
 
@@ -1213,11 +1116,13 @@ def get_daily_report(db, target_date: date = None, page: int = 1, page_size: int
                 "reached_count": 0,
                 "newly_reached": 0,
                 "newly_below": 0,
+                "continuous_below": 0,
                 "reached_rate": 0.0,
                 "reached_rate_change": 0.0
             },
             "newly_reached": [],
             "newly_below": [],
+            "all_below_stocks": [],
             "reached_stocks": [],
             "total_reached": 0
         }
@@ -1225,10 +1130,10 @@ def get_daily_report(db, target_date: date = None, page: int = 1, page_size: int
     # 获取前一交易日快照
     yesterday_snapshots = crud.get_previous_trading_day_snapshots(db, target_date)
 
-    # 构建昨日数据索引
+    # 构建昨日数据索引（只保留每个股票的最新快照，即第一条记录）
     yesterday_data = {}
     for snap in yesterday_snapshots:
-        if snap.snapshot_date < target_date:
+        if snap.snapshot_date < target_date and snap.stock_id not in yesterday_data:
             yesterday_data[snap.stock_id] = {
                 "date": snap.snapshot_date,
                 "ma_results": json.loads(snap.ma_results) if snap.ma_results else {}
@@ -1248,6 +1153,9 @@ def get_daily_report(db, target_date: date = None, page: int = 1, page_size: int
     # ========== 新增：达标个股聚合 ==========
     reached_stocks_map = {}  # stock_id -> {stock_info, indicators: []}
 
+    # ========== 新增：未达标个股聚合（含分类） ==========
+    all_below_stocks_list = []  # 所有未达标股票列表
+
     # 昨日达标率
     yesterday_reached_count = 0
     yesterday_total = 0
@@ -1260,7 +1168,7 @@ def get_daily_report(db, target_date: date = None, page: int = 1, page_size: int
         if is_reached:
             reached_count += 1
 
-        # ========== 新增：收集达标指标的详细信息 ==========
+        # ========== 收集达标指标的详细信息 ==========
         stock = stocks.get(snap.stock_id)
         if stock and is_reached:
             reached_indicators = []
@@ -1269,10 +1177,25 @@ def get_daily_report(db, target_date: date = None, page: int = 1, page_size: int
             for ma_type, result in ma_results.items():
                 if result.get("reached_target", False):
                     deviation = result.get("price_difference_percent", 0)
+
+                    # 计算 reach_type：判断是新增达标还是持续达标
+                    if snap.stock_id in yesterday_data:
+                        yesterday_ma = yesterday_data[snap.stock_id]["ma_results"]
+                        yesterday_result = yesterday_ma.get(ma_type, {})
+                        yesterday_reached = yesterday_result.get("reached_target", False)
+
+                        if yesterday_reached:
+                            reach_type = "continuous_reach"  # 昨日达标 → 今日达标
+                        else:
+                            reach_type = "new_reach"  # 昨日未达标 → 今日达标
+                    else:
+                        reach_type = "new_reach"  # 无昨日数据，视为新增
+
                     reached_indicators.append({
                         "ma_type": ma_type,
                         "ma_price": result.get("ma_price", 0),
-                        "price_difference_percent": deviation
+                        "price_difference_percent": deviation,
+                        "reach_type": reach_type
                     })
                     max_deviation = max(max_deviation, abs(deviation))
 
@@ -1292,7 +1215,36 @@ def get_daily_report(db, target_date: date = None, page: int = 1, page_size: int
                 "reached_indicators": reached_indicators
             }
 
-        # 对比昨日
+        # ========== 新增：收集所有未达标股票（含分类） ==========
+        if stock:
+            yesterday_ma = yesterday_data.get(snap.stock_id, {}).get("ma_results", {})
+
+            for ma_type, today_result in ma_results.items():
+                today_reached = today_result.get("reached_target", False)
+
+                # 只处理未达标的 MA
+                if not today_reached:
+                    yesterday_result = yesterday_ma.get(ma_type, {})
+                    yesterday_reached = yesterday_result.get("reached_target", False)
+
+                    # 判断 fall_type
+                    if snap.stock_id in yesterday_data and yesterday_reached:
+                        fall_type = "new_fall"  # 昨日达标 → 今日不达标
+                    else:
+                        fall_type = "continuous_below"  # 持续未达标或无昨日数据
+
+                    all_below_stocks_list.append({
+                        "stock_id": snap.stock_id,
+                        "symbol": stock.symbol,
+                        "name": stock.name,
+                        "current_price": snap.price or 0,
+                        "ma_type": ma_type,
+                        "ma_price": today_result.get("ma_price", 0),
+                        "price_difference_percent": today_result.get("price_difference_percent", 0),
+                        "fall_type": fall_type
+                    })
+
+        # 对比昨日（保留原有逻辑用于 newly_reached 和 newly_below）
         if stock and snap.stock_id in yesterday_data:
             yesterday_ma = yesterday_data[snap.stock_id]["ma_results"]
 
@@ -1314,7 +1266,7 @@ def get_daily_report(db, target_date: date = None, page: int = 1, page_size: int
                         "price_difference_percent": today_result.get("price_difference_percent", 0)
                     })
                 elif not today_reached and yesterday_reached:
-                    # 跌破均线
+                    # 跌破均线（状态变化）
                     newly_below_list.append({
                         "stock_id": snap.stock_id,
                         "symbol": stock.symbol,
@@ -1352,6 +1304,28 @@ def get_daily_report(db, target_date: date = None, page: int = 1, page_size: int
     end_idx = start_idx + page_size
     paginated_reached_stocks = all_reached_stocks[start_idx:end_idx]
 
+    # ========== 新增：未达标股票排序 ==========
+    # 按 MA 类型排序，然后按 fall_type（new_fall 优先），最后按偏离度（最负优先）
+    def get_ma_number(item):
+        """提取 MA 类型中的数字用于排序"""
+        import re
+        match = re.search(r'\d+', item.get("ma_type", "MA0"))
+        return int(match.group()) if match else 0
+
+    def below_sort_key(item):
+        """未达标股票排序键"""
+        ma_num = get_ma_number(item)
+        # fall_type: new_fall=0, continuous_below=1（new_fall 优先）
+        fall_order = 0 if item.get("fall_type") == "new_fall" else 1
+        # 偏离度升序（最负的排前面）
+        deviation = item.get("price_difference_percent", 0)
+        return (ma_num, fall_order, deviation)
+
+    sorted_all_below_stocks = sorted(all_below_stocks_list, key=below_sort_key)
+
+    # 计算持续未达标数量
+    continuous_below_count = sum(1 for item in all_below_stocks_list if item.get("fall_type") == "continuous_below")
+
     return {
         "date": target_date,
         "has_today": True,
@@ -1361,54 +1335,13 @@ def get_daily_report(db, target_date: date = None, page: int = 1, page_size: int
             "reached_count": reached_count,
             "newly_reached": len(newly_reached_list),
             "newly_below": len(newly_below_list),
+            "continuous_below": continuous_below_count,
             "reached_rate": round(today_rate, 1),
             "reached_rate_change": round(rate_change, 1)
         },
         "newly_reached": newly_reached_list,
         "newly_below": newly_below_list,
+        "all_below_stocks": sorted_all_below_stocks,
         "reached_stocks": paginated_reached_stocks,
         "total_reached": total_reached
     }
-
-
-def get_trend_data(db, days: int = 7) -> List[Dict]:
-    """
-    获取趋势数据
-
-    Args:
-        db: 数据库会话
-        days: 天数
-
-    Returns:
-        List[Dict]: 趋势数据点列表
-    """
-    from . import crud
-
-    # 获取快照数据
-    snapshots_by_date = crud.get_snapshots_for_trend(db, days)
-
-    if not snapshots_by_date:
-        return []
-
-    # 按日期排序，取最近 N 个交易日
-    sorted_dates = sorted(snapshots_by_date.keys(), reverse=True)[:days]
-    sorted_dates.reverse()  # 从旧到新排列
-
-    trend_data = []
-    for d in sorted_dates:
-        snapshots = snapshots_by_date[d]
-        total = len(snapshots)
-        reached = 0
-
-        for snap in snapshots:
-            ma_results = json.loads(snap.ma_results) if snap.ma_results else {}
-            if any(r.get("reached_target", False) for r in ma_results.values()):
-                reached += 1
-
-        trend_data.append({
-            "date": d.strftime("%m/%d"),
-            "reached_count": reached,
-            "reached_rate": round(reached / total * 100, 1) if total > 0 else 0
-        })
-
-    return trend_data

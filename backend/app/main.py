@@ -332,6 +332,34 @@ def refresh_trading_calendar(
     }
 
 
+@app.get("/trading-calendar/monthly", tags=["交易日历"])
+def get_monthly_trading_days(
+    year: int = Query(..., description="年份"),
+    month: int = Query(..., description="月份 (1-12)"),
+    db: Session = Depends(get_db)
+):
+    """获取指定月份的交易日列表"""
+    from calendar import monthrange
+    from datetime import date as date_type
+    from . import crud
+
+    # 获取该月的天数
+    _, days_in_month = monthrange(year, month)
+
+    # 构建日期范围
+    start_date = date_type(year, month, 1)
+    end_date = date_type(year, month, days_in_month)
+
+    # 从数据库获取交易日历
+    trading_days = crud.get_trading_days_in_range(db, start_date, end_date)
+
+    return {
+        "year": year,
+        "month": month,
+        "trading_days": [d.isoformat() for d in trading_days]
+    }
+
+
 # ============ 快照和报告 API ============
 
 @app.post("/snapshots/generate", response_model=schemas.GenerateSnapshotsResponse, tags=["快照管理"])

@@ -21,6 +21,7 @@ import {
   Modal,
   Table,
   Pagination,
+  Collapse,
 } from "antd";
 import {
   RiseOutlined,
@@ -37,6 +38,61 @@ import dayjs from "dayjs";
 import { stockApi } from "../services/api";
 
 const { Title, Text } = Typography;
+const { Panel } = Collapse;
+
+// ============ MA 分组辅助函数 ============
+
+/**
+ * 提取 MA 类型中的数字（用于排序）
+ * @param {string} maType - MA 类型，如 "MA5", "MA10"
+ * @returns {number} - 数字值
+ */
+const getMANumber = (maType) => {
+  const match = maType?.match(/\d+/);
+  return match ? parseInt(match[0], 10) : 0;
+};
+
+/**
+ * 将扁平数组按 ma_type 分组
+ * @param {Array} items - 扁平数组
+ * @returns {Object} - { "MA5": [...], "MA10": [...] }
+ */
+const groupByMA = (items) => {
+  if (!items || items.length === 0) return {};
+  return items.reduce((acc, item) => {
+    const maType = item.ma_type || "Unknown";
+    if (!acc[maType]) {
+      acc[maType] = [];
+    }
+    acc[maType].push(item);
+    return acc;
+  }, {});
+};
+
+/**
+ * 按偏离度降序排序组内项目
+ * @param {Array} items - 项目数组
+ * @returns {Array} - 排序后的数组
+ */
+const sortItemsByDeviation = (items) => {
+  if (!items) return [];
+  return [...items].sort((a, b) => {
+    const devA = Math.abs(a.price_difference_percent || 0);
+    const devB = Math.abs(b.price_difference_percent || 0);
+    return devB - devA; // 降序
+  });
+};
+
+/**
+ * 过滤空分组并按 MA 数字升序排序
+ * @param {Object} groups - 分组对象
+ * @returns {Array} - 排序后的分组键数组
+ */
+const getSortedGroupKeys = (groups) => {
+  return Object.keys(groups)
+    .filter((key) => groups[key] && groups[key].length > 0) // 过滤空分组
+    .sort((a, b) => getMANumber(a) - getMANumber(b)); // 按数字升序
+};
 
 const DailyReport = () => {
   const [loading, setLoading] = useState(false);
@@ -46,6 +102,7 @@ const DailyReport = () => {
   const [report, setReport] = useState(null);
   const [trendData, setTrendData] = useState(null);
   const [availableDates, setAvailableDates] = useState([]);
+  const [tradingDays, setTradingDays] = useState([]); // 当前月份的交易日列表
   const [selectedDate, setSelectedDate] = useState(null);
   const [prevDate, setPrevDate] = useState(null);
   const [nextDate, setNextDate] = useState(null);
@@ -68,6 +125,18 @@ const DailyReport = () => {
       return dates;
     } catch (error) {
       console.error("加载快照日期失败:", error);
+      return [];
+    }
+  };
+
+  // 加载指定月份的交易日数据
+  const loadTradingDays = async (year, month) => {
+    try {
+      const data = await stockApi.getMonthlyTradingDays(year, month);
+      setTradingDays(data.trading_days || []);
+      return data.trading_days || [];
+    } catch (error) {
+      console.error("加载交易日数据失败:", error);
       return [];
     }
   };
@@ -253,10 +322,60 @@ const DailyReport = () => {
     return current && current.isAfter(dayjs().endOf("day"));
   };
 
+  // 自定义日期单元格渲染：为有报告的交易日添加绿色小圆点
+  const renderDateCell = (current, info) => {
+    if (info.type !== "date") return info.originNode;
+
+    const dateStr = current.format("YYYY-MM-DD");
+
+    // 检查是否为交易日
+    const isTradingDay = tradingDays.includes(dateStr);
+    if (!isTradingDay) {
+      return info.originNode;
+    }
+
+    // 检查当前日期是否有报告
+    const hasReport = availableDates.some(
+      (d) => d.format("YYYY-MM-DD") === dateStr,
+    );
+
+    if (hasReport) {
+      return (
+        <div className="ant-picker-cell-inner" style={{ position: "relative" }}>
+          {current.date()}
+          <span
+            style={{
+              position: "absolute",
+              top: 2,
+              right: 2,
+              width: 6,
+              height: 6,
+              borderRadius: "50%",
+              background: "#52c41a",
+            }}
+          />
+        </div>
+      );
+    }
+
+    return info.originNode;
+  };
+
+  // 日历面板切换时加载对应月份的交易日数据
+  const handlePanelChange = (date, mode) => {
+    if (mode === "date") {
+      loadTradingDays(date.year(), date.month() + 1);
+    }
+  };
+
   useEffect(() => {
     const init = async () => {
       const dates = await loadSnapshotDates();
       const status = await loadSnapshotStatus();
+
+      // 加载当前月份的交易日数据
+      const today = dayjs();
+      await loadTradingDays(today.year(), today.month() + 1);
 
       // 检查今天是否为交易日
       const tradingInfo = await checkTradingDayStatus();
@@ -304,6 +423,48 @@ const DailyReport = () => {
           }
         />
       </List.Item>
+    );
+  };
+
+  // 渲染 MA 分组折叠面板
+  const renderMACollapsePanel = (items, type) => {
+    const isRise = type === "reached";
+    const grouped = groupByMA(items);
+    const sortedKeys = getSortedGroupKeys(grouped);
+
+    if (sortedKeys.length === 0) {
+      return (
+        <Empty
+          image={Empty.PRESENTED_IMAGE_SIMPLE}
+          description={isRise ? "无新增达标" : "无跌破均线"}
+        />
+      );
+    }
+
+    return (
+      <Collapse defaultActiveKey={sortedKeys} ghost expandIconPosition="end">
+        {sortedKeys.map((maType) => {
+          const groupItems = sortItemsByDeviation(grouped[maType]);
+          return (
+            <Panel
+              key={maType}
+              header={
+                <Space>
+                  <Tag color={isRise ? "success" : "error"}>{maType}</Tag>
+                  <Text strong>{maType}</Text>
+                  <Text type="secondary">({groupItems.length}只)</Text>
+                </Space>
+              }
+            >
+              <List
+                dataSource={groupItems}
+                renderItem={(item) => renderChangeItem(item, type)}
+                size="small"
+              />
+            </Panel>
+          );
+        })}
+      </Collapse>
     );
   };
 
@@ -515,7 +676,9 @@ const DailyReport = () => {
               <DatePicker
                 value={selectedDate || dayjs()}
                 onChange={handleDateChange}
+                onPanelChange={handlePanelChange}
                 disabledDate={disabledDate}
+                cellRender={renderDateCell}
                 allowClear={false}
                 style={{ width: 150 }}
                 format="YYYY-MM-DD"
@@ -540,22 +703,6 @@ const DailyReport = () => {
         }
       >
         <Spin spinning={loading}>
-          {/* 非交易日提示 */}
-          {isNonTradingDay && (
-            <Alert
-              message="该日期为非交易日"
-              description={
-                <Space direction="vertical">
-                  <span>原因：{tradingDayInfo?.reason || "市场休市"}</span>
-                  <span>您可以选择历史交易日查看或生成报告</span>
-                </Space>
-              }
-              type="warning"
-              icon={<WarningOutlined />}
-              showIcon
-              style={{ marginBottom: 24 }}
-            />
-          )}
           {report ? (
             <>
               {/* 概览卡片 */}
@@ -657,18 +804,7 @@ const DailyReport = () => {
                     }
                     size="small"
                   >
-                    {report.newly_reached.length > 0 ? (
-                      <List
-                        dataSource={report.newly_reached}
-                        renderItem={(item) => renderChangeItem(item, "reached")}
-                        size="small"
-                      />
-                    ) : (
-                      <Empty
-                        image={Empty.PRESENTED_IMAGE_SIMPLE}
-                        description="无新增达标"
-                      />
-                    )}
+                    {renderMACollapsePanel(report.newly_reached, "reached")}
                   </Card>
                 </Col>
                 <Col xs={24} lg={12}>
@@ -682,18 +818,7 @@ const DailyReport = () => {
                     }
                     size="small"
                   >
-                    {report.newly_below.length > 0 ? (
-                      <List
-                        dataSource={report.newly_below}
-                        renderItem={(item) => renderChangeItem(item, "below")}
-                        size="small"
-                      />
-                    ) : (
-                      <Empty
-                        image={Empty.PRESENTED_IMAGE_SIMPLE}
-                        description="无跌破均线"
-                      />
-                    )}
+                    {renderMACollapsePanel(report.newly_below, "below")}
                   </Card>
                 </Col>
               </Row>
@@ -795,6 +920,36 @@ const DailyReport = () => {
               {/* 趋势图表 */}
               <Card title="近 7 日趋势">{renderTrendChart()}</Card>
             </>
+          ) : isNonTradingDay ? (
+            /* 非交易日友好提示 */
+            <div
+              style={{
+                padding: "48px 24px",
+                textAlign: "center",
+                background: "#fafafa",
+                borderRadius: "8px",
+              }}
+            >
+              <ClockCircleOutlined
+                style={{ fontSize: "64px", color: "#faad14", marginBottom: 24 }}
+              />
+              <Title level={4} style={{ marginBottom: 8 }}>
+                该日期为非交易日
+              </Title>
+              <Text type="secondary" style={{ fontSize: "16px" }}>
+                {tradingDayInfo?.reason === "周末"
+                  ? "股票市场周末休市"
+                  : tradingDayInfo?.reason === "节假日"
+                    ? "股票市场节假日休市"
+                    : "该日期市场休市"}
+              </Text>
+              <div style={{ marginTop: 24 }}>
+                <Text type="secondary">
+                  💡
+                  提示：您可以使用上方左右箭头切换日期，或点击日期打开日历选择历史交易日
+                </Text>
+              </div>
+            </div>
           ) : (
             <Empty description="加载中..." />
           )}

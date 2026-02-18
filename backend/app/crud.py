@@ -345,3 +345,14 @@ def delete_trading_calendar_by_year(db: Session, year: int) -> int:
     ).delete()
     db.commit()
     return count
+
+
+def get_trading_days_in_range(db: Session, start_date: date, end_date: date) -> List[date]:
+    """获取指定日期范围内的所有交易日"""
+    records = db.query(models.TradingCalendar).filter(
+        models.TradingCalendar.trade_date >= start_date,
+        models.TradingCalendar.trade_date <= end_date,
+        models.TradingCalendar.is_trading_day == 1
+    ).order_by(models.TradingCalendar.trade_date).all()
+
+    return [record.trade_date for record in records]

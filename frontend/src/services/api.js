@@ -186,6 +186,14 @@ export const stockApi = {
     return response.data;
   },
 
+  // 获取指定月份的交易日列表
+  getMonthlyTradingDays: async (year, month) => {
+    const response = await apiClient.get("/trading-calendar/monthly", {
+      params: { year, month },
+    });
+    return response.data;
+  },
+
   // 刷新交易日历缓存
   refreshTradingCalendar: async (year = null) => {
     const params = {};

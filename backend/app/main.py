@@ -562,6 +562,172 @@ def get_daily_report(
     )
 
 
+# ============ 高级数据 API（财报、估值、宏观） ============
+
+@app.get("/stocks/{symbol}/financial/report", tags=["高级数据"])
+def get_financial_report(
+    symbol: str,
+    report_type: str = Query("balance_sheet", description="报告类型: balance_sheet, income, cash_flow"),
+    period: str = Query("quarterly", description="周期: annual, quarterly"),
+    use_cache: bool = Query(True, description="是否使用缓存"),
+    db: Session = Depends(get_db)
+):
+    """
+    获取股票财报数据
+
+    支持的财报类型:
+    - balance_sheet: 资产负债表
+    - income: 利润表
+    - cash_flow: 现金流量表
+
+    支持的周期:
+    - annual: 年报
+    - quarterly: 季报
+    """
+    from .services.advanced import get_financial_report as fetch_financial
+    from .services import normalize_symbol_for_sina
+
+    # 获取股票信息
+    db_stock = crud.get_stock_by_symbol(db, symbol=symbol)
+    if db_stock is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"股票 {symbol} 不存在"
+        )
+
+    # 规范化代码
+    normalized_code, market = normalize_symbol_for_sina(symbol)
+
+    # 获取财报数据
+    result = fetch_financial(
+        symbol=symbol,
+        normalized_code=normalized_code,
+        market=market,
+        name=db_stock.name,
+        report_type=report_type,
+        period=period,
+        use_cache=use_cache
+    )
+
+    # 检查是否有错误
+    if "error" in result:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=result
+        )
+
+    return result
+
+
+@app.get("/stocks/{symbol}/valuation", tags=["高级数据"])
+def get_valuation_metrics(
+    symbol: str,
+    use_cache: bool = Query(True, description="是否使用缓存"),
+    db: Session = Depends(get_db)
+):
+    """
+    获取股票估值指标
+
+    返回指标包括:
+    - PE (市盈率)
+    - PB (市净率)
+    - ROE (净资产收益率)
+    - 营收增长率
+    - 利润率
+    - 负债权益比
+    等
+    """
+    from .services.advanced import get_valuation_metrics as fetch_valuation
+    from .services import normalize_symbol_for_sina
+
+    # 获取股票信息
+    db_stock = crud.get_stock_by_symbol(db, symbol=symbol)
+    if db_stock is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"股票 {symbol} 不存在"
+        )
+
+    # 规范化代码
+    normalized_code, market = normalize_symbol_for_sina(symbol)
+
+    # 获取估值数据
+    result = fetch_valuation(
+        symbol=symbol,
+        normalized_code=normalized_code,
+        market=market,
+        name=db_stock.name,
+        current_price=db_stock.current_price,
+        use_cache=use_cache
+    )
+
+    # 检查是否有错误
+    if "error" in result:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=result
+        )
+
+    return result
+
+
+@app.get("/macro/indicators", tags=["高级数据"])
+def get_macro_indicators(
+    market: str = Query("cn", description="市场: cn (中国), us (美国)"),
+    indicators: str = Query("gdp,cpi,interest_rate", description="指标列表，逗号分隔"),
+    use_cache: bool = Query(True, description="是否使用缓存")
+):
+    """
+    获取宏观经济指标
+
+    支持的市场:
+    - cn: 中国
+    - us: 美国
+
+    支持的指标:
+    - gdp: GDP增长率
+    - cpi: 消费者物价指数
+    - interest_rate: 基准利率
+    """
+    from .services.advanced import get_macro_indicators as fetch_macro
+
+    # 解析指标列表
+    indicator_list = [ind.strip() for ind in indicators.split(",") if ind.strip()]
+
+    # 获取宏观指标数据
+    result = fetch_macro(
+        market=market,
+        indicators=indicator_list,
+        use_cache=use_cache
+    )
+
+    # 检查是否有错误
+    if "error" in result:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=result
+        )
+
+    return result
+
+
+@app.get("/providers/capabilities", tags=["数据源管理"])
+def get_providers_capabilities():
+    """
+    获取所有数据源的能力映射
+
+    返回各数据源支持的数据类型:
+    - realtime_price: 实时价格
+    - kline_data: K线数据
+    - financial_report: 财报数据
+    - valuation_metrics: 估值指标
+    - macro_indicators: 宏观经济指标
+    """
+    from .providers import get_coordinator
+    coordinator = get_coordinator()
+    return coordinator.get_capabilities()
+
+
 # ============ 数据源管理 API ============
 
 @app.get("/providers/health", tags=["数据源管理"])

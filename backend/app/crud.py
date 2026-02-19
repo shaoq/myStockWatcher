@@ -60,6 +60,81 @@ def batch_update_stock_groups(db: Session, stock_ids: List[int], group_ids: List
     return len(stocks)
 
 
+def batch_assign_groups_to_stocks(
+    db: Session,
+    stock_ids: List[int],
+    group_names: List[str]
+) -> Dict:
+    """
+    批量将股票归属到分组（追加模式）
+
+    Args:
+        db: 数据库会话
+        stock_ids: 股票ID列表
+        group_names: 分组名称列表（不存在则自动创建）
+
+    Returns:
+        包含 assigned_count, skipped_count, created_groups, message 的字典
+    """
+    # 1. 获取或创建分组
+    groups = []
+    created_groups = []
+
+    for name in group_names:
+        # 查找现有分组
+        group = db.query(models.Group).filter(models.Group.name == name).first()
+        if not group:
+            # 创建新分组
+            group = models.Group(name=name)
+            db.add(group)
+            db.flush()  # 获取ID但不提交
+            created_groups.append(name)
+        groups.append(group)
+
+    # 2. 获取股票
+    stocks = db.query(models.Stock).filter(models.Stock.id.in_(stock_ids)).all()
+
+    # 3. 追加分组（跳过已在分组内的）
+    assigned_count = 0
+    skipped_count = 0
+
+    for stock in stocks:
+        existing_group_ids = {g.id for g in stock.groups}
+        new_groups_added = False
+
+        for group in groups:
+            if group.id not in existing_group_ids:
+                stock.groups.append(group)
+                new_groups_added = True
+
+        if new_groups_added:
+            assigned_count += 1
+        else:
+            skipped_count += 1
+
+    db.commit()
+
+    # 4. 构建消息
+    if assigned_count > 0 and skipped_count > 0:
+        message = f"{assigned_count} 只股票已归属，{skipped_count} 只已在分组内跳过"
+    elif assigned_count > 0:
+        group_count = len(groups)
+        message = f"已成功将 {assigned_count} 只股票归属到 {group_count} 个分组"
+    else:
+        message = f"所有 {skipped_count} 只股票已在目标分组内"
+
+    if created_groups:
+        message += f"（新建分组：{', '.join(created_groups)}）"
+
+    return {
+        "success": True,
+        "assigned_count": assigned_count,
+        "skipped_count": skipped_count,
+        "created_groups": created_groups,
+        "message": message
+    }
+
+
 def create_stock(db: Session, stock: schemas.StockCreate) -> models.Stock:
     """创建新股票"""
     db_stock = models.Stock(

@@ -21,27 +21,44 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## 项目架构
 
 ### 技术栈
-- **后端**: FastAPI, SQLAlchemy (ORM), SQLite (数据库), 新浪财经 API (股票数据)
+- **后端**: FastAPI, SQLAlchemy (ORM), SQLite (数据库)
+- **数据源**: 多数据源协调器（新浪/东方财富/腾讯/网易 + AKShare + OpenBB）
 - **前端**: React 18+, Vite (构建工具), Ant Design (UI 框架), Axios (HTTP 客户端)
 
 ### 核心功能
 基于移动平均线（MA）的股票价格预警系统，支持：
 - 股票信息管理（CRUD）
-- 实时价格查询（新浪财经 API）
+- 实时价格查询（多数据源协调器：新浪→东方财富→腾讯→网易）
 - 多移动平均线指标监控（MA5, MA20 等，逗号分隔）
 - 股票分组管理（多对多关系）
 - 趋势图 URL 生成
 - 交易时间智能缓存（区分实时/缓存数据）
 - 每日报告生成与历史报告查看
 - 交易日历智能判断（多层数据源保障）
+- 高级数据功能：
+  - **A 股**（AKShare）：财报数据、估值指标（PE/PB）
+  - **美股/全球**（OpenBB）：财报数据、估值指标、宏观经济指标（GDP/CPI/利率）
 
 ### 目录结构与核心逻辑
 - **`backend/app/`**:
     - `main.py`: FastAPI 应用入口，定义所有 RESTful API 路由
     - `models.py`: 数据库模型（`Stock`, `Group`, `StockSnapshot`, `TradingCalendar`）
-    - `schemas.py`: Pydantic 模式，负责请求验证和响应序列化
+    - `schemas/`: Pydantic 模式目录
+        - `__init__.py`: 基础模式
+        - `advanced.py`: 高级数据模式（财报、估值、宏观）
     - `crud.py`: 封装底层数据库 CRUD 操作
-    - `services.py`: 业务逻辑层，包含交易日历、快照生成、报告计算等
+    - `services/`: 业务逻辑层目录
+        - `__init__.py`: 核心业务逻辑（交易日历、快照生成、报告计算、缓存）
+        - `advanced/`: 高级数据服务
+            - `financial.py`: 财报服务
+            - `valuation.py`: 估值服务
+            - `macro.py`: 宏观经济服务
+    - `providers/`: 数据源提供者目录
+        - `base.py`: 数据源基类和能力声明
+        - `coordinator.py`: 多数据源协调器
+        - `sina.py`, `eastmoney.py`, `tencent.py`, `netease.py`: 基础数据源
+        - `akshare.py`: A 股高级数据源（财报、估值）
+        - `openbb/`: OpenBB 高级数据源（美股、宏观）
     - `database.py`: 数据库连接配置（SQLite）
 - **`frontend/src/`**:
     - `components/StockList.jsx`: 核心股票管理界面
@@ -67,6 +84,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - 交易日历端点：`/trading-calendar/check`, `/trading-calendar/refresh`
 - 快照管理端点：`/snapshots/generate`, `/snapshots/check-today`, `/snapshots/dates`
 - 每日报告端点：`/reports/daily`（支持分页）
+- 高级数据端点（多数据源）：
+  - `GET /stocks/{symbol}/financial/report` - 获取财报数据（A股: AKShare, 美股: OpenBB）
+  - `GET /stocks/{symbol}/valuation` - 获取估值指标（A股: AKShare, 美股: OpenBB）
+  - `GET /macro/indicators` - 获取宏观经济指标（OpenBB，支持 us/cn 市场）
+- 数据源管理端点：`/providers/health`, `/providers/capabilities`
 
 ### 数据流向
 1. 用户在前端输入股票代码 → `createStock()` → 后端 `/stocks/`
@@ -211,3 +233,89 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `trade_date`: 日期
 - `is_trading_day`: 是否为交易日 (0/1)
 - `year`: 年份（用于批量查询缓存）
+
+## 多数据源架构
+
+### 数据源协调器
+
+系统采用多数据源协调器架构，支持自动 fallback 和智能路由：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                  DataSourceCoordinator                          │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │  L1: 新浪财经 (最快，易封禁) - 实时价格/K线                  │ │
+│  │  L2: 东方财富 (AKShare，稳定) - 实时价格/K线                 │ │
+│  │  L3: 腾讯财经 (备用) - 实时价格/K线                          │ │
+│  │  L4: 网易财经 (兜底) - 实时价格/K线                          │ │
+│  │  L4: AKShare (A 股高级数据) - 财报/估值                      │ │
+│  │  L5: OpenBB (美股/全球高级数据) - 财报/估值/宏观             │ │
+│  └────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Provider 能力声明
+
+每个数据源提供者通过 `CAPABILITIES` 属性声明支持的能力：
+- `realtime_price`: 实时价格
+- `kline_data`: K线数据
+- `financial_report`: 财报数据
+- `valuation_metrics`: 估值指标
+- `macro_indicators`: 宏观经济指标
+
+**各 Provider 能力对照表**：
+| Provider | 实时价格 | K线 | 财报 | 估值 | 宏观 |
+|----------|---------|-----|------|------|------|
+| sina | ✅ | ✅ | - | - | - |
+| eastmoney | ✅ | ✅ | - | - | - |
+| tencent | ✅ | ✅ | - | - | - |
+| netease | ✅ | ✅ | - | - | - |
+| akshare | - | - | ✅ (A股) | ✅ (A股) | - |
+| openbb | ✅ | ✅ | ✅ (美股) | ✅ (美股) | ✅ |
+
+协调器根据请求的能力类型和市场，自动路由到支持该能力的 Provider。
+
+### AKShare 集成（A 股高级数据）
+
+AKShare 是开源财经数据接口库，提供 A 股财报和估值数据。
+
+**已安装**：作为项目依赖，无需额外安装
+
+**支持功能**：
+- A 股财报数据（资产负债表、利润表、现金流量表）
+- A 股估值指标（PE、PB、ROE、每股收益等）
+
+**数据来源**：东方财富、同花顺等
+
+### OpenBB 集成（美股/全球高级数据）
+
+OpenBB 是开源金融数据平台，提供美股财报、估值、宏观等高级数据。
+
+**安装依赖**：
+```bash
+cd backend
+pip install openbb>=4.0.0
+```
+
+**FMP API 配置**（用于美股估值/财报）：
+```python
+# 在 app/providers/openbb/provider.py 中配置
+obb.user.credentials.fmp_api_key = "your-api-key"
+```
+
+**A股代码转换**：
+OpenBB 使用 Yahoo Finance 格式，系统自动转换：
+- `sh600000` → `600000.SHA` (上海)
+- `sz000001` → `000001.SZE` (深圳)
+
+**缓存策略**：
+| 数据类型 | 缓存时间 |
+|---------|---------|
+| 财报数据 | 24小时 |
+| 估值指标 | 1小时 |
+| 宏观指标 | 24小时 |
+
+**错误处理**：
+- OpenBB/AKShare 未安装时，高级数据端点返回 503 错误
+- 数据获取失败时，返回详细错误信息
+

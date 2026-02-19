@@ -22,6 +22,7 @@ import {
   Tooltip,
   Dropdown,
   Switch,
+  Progress,
 } from "antd";
 import {
   PlusOutlined,
@@ -34,6 +35,10 @@ import {
   SettingOutlined,
   SyncOutlined,
   ClockCircleOutlined,
+  FolderAddOutlined,
+  RiseOutlined,
+  FallOutlined,
+  PauseOutlined,
 } from "@ant-design/icons";
 import { stockApi } from "../services/api";
 import StockChart from "./StockChart";
@@ -139,6 +144,11 @@ const StockList = ({ groupId, groups: parentGroups, onGroupsChange }) => {
   const [chartLoading, setChartLoading] = useState(false);
   const [form] = Form.useForm();
   const prevGroupsRef = useRef(parentGroups);
+
+  // 批量归属相关状态
+  const [assignModalVisible, setAssignModalVisible] = useState(false);
+  const [assignForm] = Form.useForm();
+  const [assignGroupNames, setAssignGroupNames] = useState([]);
 
   const loadStocks = async () => {
     setLoading(true);
@@ -447,6 +457,46 @@ const StockList = ({ groupId, groups: parentGroups, onGroupsChange }) => {
     }
   };
 
+  // 批量归属处理函数
+  const handleBatchAssign = async () => {
+    try {
+      const values = await assignForm.validateFields();
+      const groupNames = values.group_names || [];
+
+      if (groupNames.length === 0) {
+        message.warning("请至少选择或输入一个分组");
+        return;
+      }
+
+      setLoading(true);
+      const result = await stockApi.batchAssignGroups(
+        selectedRowKeys,
+        groupNames,
+      );
+
+      // 显示结果消息
+      if (result.success) {
+        message.success(result.message);
+      } else {
+        message.warning(result.message);
+      }
+
+      // 关闭弹窗并重置
+      setAssignModalVisible(false);
+      assignForm.resetFields();
+      setAssignGroupNames([]);
+      setSelectedRowKeys([]);
+
+      // 刷新列表和分组
+      loadStocks();
+      if (onGroupsChange) onGroupsChange();
+    } catch (error) {
+      message.error("操作失败: " + error.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const onSelectChange = (newSelectedRowKeys) => {
     setSelectedRowKeys(newSelectedRowKeys);
   };
@@ -468,16 +518,62 @@ const StockList = ({ groupId, groups: parentGroups, onGroupsChange }) => {
       }
     }
 
+    // 显示进度 Modal
+    const progressModal = Modal.info({
+      title: "批量刷新中",
+      icon: null,
+      content: (
+        <div style={{ marginTop: 16 }}>
+          <Progress percent={100} status="active" />
+          <p style={{ marginTop: 12, color: "#666" }}>
+            正在获取 {stocks.length} 只股票数据，请稍候...
+          </p>
+          <p style={{ fontSize: 12, color: "#999" }}>
+            系统会自动选择最快的数据源
+          </p>
+        </div>
+      ),
+      okButtonProps: { style: { display: "none" } },
+      cancelButtonProps: { style: { display: "none" } },
+      maskClosable: false,
+      width: 400,
+    });
+
     setLoading(true);
     try {
       const result = await stockApi.updateAllPrices();
+      progressModal.destroy();
       message.success(result.message);
       loadStocks();
     } catch (error) {
+      progressModal.destroy();
       message.error("批量更新失败: " + error.message);
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleClearCacheAndRefresh = async () => {
+    Modal.confirm({
+      title: "确认强制刷新",
+      content: "将清理所有缓存并重新获取数据，这可能需要一些时间。确定继续吗？",
+      okText: "确认",
+      cancelText: "取消",
+      onOk: async () => {
+        setLoading(true);
+        try {
+          const result = await stockApi.clearCacheAndRefresh();
+          message.success(
+            `已清理缓存（K线${result.cleared_cache.kline_cache}条、价格${result.cleared_cache.price_cache}条）并刷新 ${result.refreshed_stocks} 只股票`,
+          );
+          loadStocks();
+        } catch (error) {
+          message.error("强制刷新失败: " + error.message);
+        } finally {
+          setLoading(false);
+        }
+      },
+    });
   };
 
   const stats = useMemo(() => {
@@ -549,15 +645,18 @@ const StockList = ({ groupId, groups: parentGroups, onGroupsChange }) => {
     {
       title: "数据来源",
       key: "data_source",
-      width: 100,
+      width: 120,
       render: (_, record) => {
         const isRealtime = record.is_realtime;
+        const fetchedAt = record.data_fetched_at || record.updated_at;
+
         return (
           <Tooltip
             title={
-              isRealtime
-                ? "数据为实时获取"
-                : `数据来自缓存，更新于 ${formatCachedTime(record.updated_at)}`
+              <div>
+                <div>{isRealtime ? "实时获取" : "缓存数据"}</div>
+                <div>获取时间: {formatCachedTime(fetchedAt)}</div>
+              </div>
             }
           >
             <Tag
@@ -575,6 +674,56 @@ const StockList = ({ groupId, groups: parentGroups, onGroupsChange }) => {
                   缓存
                 </>
               )}
+            </Tag>
+          </Tooltip>
+        );
+      },
+    },
+    {
+      title: "买卖信号",
+      key: "signal",
+      width: 100,
+      render: (_, record) => {
+        // 从 stock 对象中读取信号数据（后端已返回）
+        const signal = record.signal;
+        if (!signal) {
+          return <Tag color="default">-</Tag>;
+        }
+
+        const signalConfig = {
+          buy: { color: "green", icon: <RiseOutlined />, text: "买入" },
+          sell: { color: "red", icon: <FallOutlined />, text: "卖出" },
+          hold: { color: "default", icon: <PauseOutlined />, text: "持有" },
+        };
+
+        const config = signalConfig[signal.signal_type] || signalConfig.hold;
+
+        return (
+          <Tooltip
+            title={
+              signal.signal_type !== "hold" ? (
+                <div style={{ fontSize: 12 }}>
+                  <div>信号强度: {signal.strength}/5</div>
+                  {signal.entry_price && (
+                    <div>建议价位: ¥{signal.entry_price.toFixed(2)}</div>
+                  )}
+                  {signal.stop_loss && (
+                    <div>止损价位: ¥{signal.stop_loss.toFixed(2)}</div>
+                  )}
+                  {signal.take_profit && (
+                    <div>目标价位: ¥{signal.take_profit.toFixed(2)}</div>
+                  )}
+                  {signal.triggers?.length > 0 && (
+                    <div>触发条件: {signal.triggers.join("、")}</div>
+                  )}
+                </div>
+              ) : (
+                "无明显买卖信号"
+              )
+            }
+          >
+            <Tag color={config.color} style={{ cursor: "help" }}>
+              {config.icon} {config.text}
             </Tag>
           </Tooltip>
         );
@@ -868,14 +1017,27 @@ const StockList = ({ groupId, groups: parentGroups, onGroupsChange }) => {
               style={{ width: 200 }}
             />
             {selectedRowKeys.length > 0 && (
-              <Popconfirm
-                title={`确认批量${groupId ? "移出" : "删除"} ${selectedRowKeys.length} 项?`}
-                onConfirm={handleBatchDelete}
-              >
-                <Button type="primary" danger icon={<DeleteOutlined />}>
-                  批量{groupId ? "移出" : "删除"}
+              <>
+                <Popconfirm
+                  title={`确认批量${groupId ? "移出" : "删除"} ${selectedRowKeys.length} 项?`}
+                  onConfirm={handleBatchDelete}
+                >
+                  <Button type="primary" danger icon={<DeleteOutlined />}>
+                    批量{groupId ? "移出" : "删除"}
+                  </Button>
+                </Popconfirm>
+                <Button
+                  icon={<FolderAddOutlined />}
+                  onClick={() => {
+                    setAssignGroupNames([]);
+                    assignForm.resetFields();
+                    loadGroups(); // 刷新分组列表
+                    setAssignModalVisible(true);
+                  }}
+                >
+                  批量归属
                 </Button>
-              </Popconfirm>
+              </>
             )}
             <Button
               icon={<ReloadOutlined />}
@@ -884,6 +1046,15 @@ const StockList = ({ groupId, groups: parentGroups, onGroupsChange }) => {
             >
               全量刷新
             </Button>
+            <Tooltip title="清理所有缓存并强制重新获取数据">
+              <Button
+                icon={<SyncOutlined />}
+                onClick={handleClearCacheAndRefresh}
+                loading={loading}
+              >
+                强制刷新
+              </Button>
+            </Tooltip>
             <Tooltip
               title={
                 isTrading
@@ -1020,6 +1191,50 @@ const StockList = ({ groupId, groups: parentGroups, onGroupsChange }) => {
             name={selectedSymbol.name}
           />
         )}
+      </Modal>
+
+      {/* 批量归属弹窗 */}
+      <Modal
+        title="批量归属到分组"
+        open={assignModalVisible}
+        onOk={handleBatchAssign}
+        onCancel={() => {
+          setAssignModalVisible(false);
+          assignForm.resetFields();
+          setAssignGroupNames([]);
+        }}
+        okButtonProps={{
+          disabled: assignGroupNames.length === 0,
+        }}
+      >
+        <div style={{ marginBottom: 16, color: "#666" }}>
+          已选中 <strong>{selectedRowKeys.length}</strong> 只股票
+        </div>
+        <Form form={assignForm} layout="vertical">
+          <Form.Item
+            name="group_names"
+            label="选择或输入分组名"
+            rules={[{ required: true, message: "请至少选择或输入一个分组" }]}
+          >
+            <Select
+              mode="tags"
+              placeholder="可选择现有分组，或输入新名称回车创建"
+              style={{ width: "100%" }}
+              onChange={(values) => {
+                setAssignGroupNames(values || []);
+              }}
+            >
+              {groups.map((group) => (
+                <Option key={group.name} value={group.name}>
+                  {group.name}
+                </Option>
+              ))}
+            </Select>
+          </Form.Item>
+        </Form>
+        <div style={{ marginTop: 8, fontSize: 12, color: "#999" }}>
+          💡 提示：可从下拉列表选择现有分组，或直接输入新分组名后回车创建
+        </div>
       </Modal>
     </div>
   );

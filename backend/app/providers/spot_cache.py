@@ -21,6 +21,10 @@ BEIJING_TZ = ZoneInfo("Asia/Shanghai")
 # 缓存有效期配置（交易时间内，单位：秒）
 CACHE_TTL_TRADING = 300  # 5 分钟
 
+# 交易日缓存（避免频繁查询数据库）
+_trading_day_cache: Dict[str, bool] = {}
+_trading_day_cache_time: Optional[datetime] = None
+
 # 全局缓存结构
 _spot_cache: Dict[str, Any] = {
     "data": None,        # DataFrame
@@ -30,11 +34,55 @@ _spot_cache: Dict[str, Any] = {
 _cache_lock = Lock()
 
 
+def _is_trading_day_with_cache(now: Optional[datetime] = None) -> bool:
+    """
+    判断今天是否为交易日（带缓存，使用与每日报告一致的判断逻辑）
+
+    使用 services.is_trading_day 判断，包含节假日判断。
+
+    Args:
+        now: 当前时间，默认使用北京时间
+
+    Returns:
+        bool: 今天是否为交易日
+    """
+    global _trading_day_cache, _trading_day_cache_time
+
+    if now is None:
+        now = datetime.now(BEIJING_TZ)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=BEIJING_TZ)
+
+    today_str = now.strftime("%Y-%m-%d")
+
+    # 检查缓存是否有效（缓存 5 分钟）
+    if _trading_day_cache_time is not None:
+        cache_age = (now - _trading_day_cache_time).total_seconds()
+        if cache_age < 300 and today_str in _trading_day_cache:
+            return _trading_day_cache[today_str]
+
+    # 缓存过期或不存在，重新查询
+    try:
+        from ..services import is_trading_day
+        is_trading, _ = is_trading_day(db=None, target_date=now.date())
+
+        # 更新缓存
+        _trading_day_cache[today_str] = is_trading
+        _trading_day_cache_time = now
+
+        return is_trading
+    except Exception as e:
+        logger.warning(f"[交易日判断] 查询失败，使用周末判断兜底 | 错误: {e}")
+        # 兜底：仅判断周末
+        return now.weekday() < 5
+
+
 def is_trading_time(now: Optional[datetime] = None) -> bool:
     """
-    判断当前是否处于 A 股交易时间
+    判断当前是否处于 A 股交易时间（交易日 + 交易时间段）
 
     A 股交易时间：
+    - 交易日判断：使用 is_trading_day（包含节假日判断）
     - 上午: 9:30 - 11:30
     - 下午: 13:00 - 15:00
 
@@ -49,8 +97,8 @@ def is_trading_time(now: Optional[datetime] = None) -> bool:
     elif now.tzinfo is None:
         now = now.replace(tzinfo=BEIJING_TZ)
 
-    # 周末不交易
-    if now.weekday() >= 5:  # 5=Saturday, 6=Sunday
+    # 首先判断是否为交易日（包含节假日判断）
+    if not _is_trading_day_with_cache(now):
         return False
 
     current_time = now.time()
@@ -73,7 +121,7 @@ def is_trading_time(now: Optional[datetime] = None) -> bool:
 
 def get_next_trading_open(now: Optional[datetime] = None) -> datetime:
     """
-    获取下一个交易日开盘时间
+    获取下一个交易日开盘时间（使用与每日报告一致的交易日判断）
 
     Args:
         now: 当前时间，默认使用北京时间
@@ -81,6 +129,8 @@ def get_next_trading_open(now: Optional[datetime] = None) -> datetime:
     Returns:
         datetime: 下一个交易日开盘时间 (9:30)
     """
+    from datetime import timedelta
+
     if now is None:
         now = datetime.now(BEIJING_TZ)
     elif now.tzinfo is None:
@@ -88,27 +138,37 @@ def get_next_trading_open(now: Optional[datetime] = None) -> datetime:
 
     current_time = now.time()
     afternoon_end = time(15, 0)
+    morning_start = time(9, 30)
 
-    # 如果当前时间在 15:00 之前，下一个开盘就是今天或明天
-    if current_time < afternoon_end and now.weekday() < 5:
-        # 工作日且在收盘前，返回今天或下一个交易时段
+    # 如果当前是交易日且在开盘前，返回今天的开盘时间
+    if current_time < morning_start and _is_trading_day_with_cache(now):
         return now.replace(hour=9, minute=30, second=0, microsecond=0)
 
-    # 否则找下一个工作日
+    # 如果当前是交易日且在收盘前，返回下一个交易日
+    if current_time < afternoon_end and _is_trading_day_with_cache(now):
+        # 找下一个交易日
+        next_day = now + timedelta(days=1)
+        for _ in range(10):  # 最多找 10 天
+            if _is_trading_day_with_cache(next_day):
+                return next_day.replace(hour=9, minute=30, second=0, microsecond=0)
+            next_day = next_day + timedelta(days=1)
+
+    # 否则找下一个交易日
     next_day = now
-    for _ in range(7):  # 最多找 7 天
+    for _ in range(10):  # 最多找 10 天
         next_day = next_day.replace(hour=0, minute=0, second=0, microsecond=0)
         next_day = datetime(
             next_day.year, next_day.month, next_day.day,
             tzinfo=BEIJING_TZ
-        ) + __import__('datetime').timedelta(days=1)
-        if next_day.weekday() < 5:  # 工作日
+        ) + timedelta(days=1)
+        if _is_trading_day_with_cache(next_day):
             return next_day.replace(hour=9, minute=30, second=0, microsecond=0)
 
-    # 兜底返回明天
-    return (now + __import__('datetime').timedelta(days=1)).replace(
-        hour=9, minute=30, second=0, microsecond=0
-    )
+    # 兜底：返回下一个工作日
+    next_day = now + timedelta(days=1)
+    while next_day.weekday() >= 5:
+        next_day = next_day + timedelta(days=1)
+    return next_day.replace(hour=9, minute=30, second=0, microsecond=0)
 
 
 def is_cache_valid(fetched_at: Optional[datetime], now: Optional[datetime] = None) -> bool:

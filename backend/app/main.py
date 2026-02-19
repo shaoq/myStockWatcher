@@ -1,6 +1,7 @@
 """FastAPI应用主入口"""
 import time
 import uuid
+import json
 from datetime import date
 from fastapi import FastAPI, Depends, HTTPException, status, Request, Response, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,6 +19,38 @@ logger = get_logger()
 
 # 创建数据库表
 models.Base.metadata.create_all(bind=engine)
+
+
+def init_default_rules():
+    """初始化默认交易规则"""
+    from .services.rule_engine import get_default_rules
+
+    # 创建新的数据库会话
+    db = next(get_db())
+    try:
+        # 检查是否已有规则
+        existing_count = db.query(models.TradingRule).count()
+        if existing_count > 0:
+            logger.info(f"[规则初始化] 已存在 {existing_count} 条规则，跳过初始化")
+            return
+
+        # 获取默认规则并插入
+        default_rules = get_default_rules()
+        for rule_data in default_rules:
+            db_rule = models.TradingRule(**rule_data)
+            db.add(db_rule)
+
+        db.commit()
+        logger.info(f"[规则初始化] 成功创建 {len(default_rules)} 条默认规则")
+    except Exception as e:
+        logger.error(f"[规则初始化] 失败: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+
+# 应用启动时初始化默认规则
+init_default_rules()
 
 
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
@@ -774,3 +807,448 @@ def reset_all_providers():
     coordinator = get_coordinator()
     coordinator.reset_all_providers()
     return {"success": True, "message": "所有数据源状态已重置"}
+
+
+# ============ 买卖信号 API ============
+
+@app.get("/stocks/{symbol}/signal", response_model=schemas.SignalResponse, tags=["买卖信号"])
+def get_stock_signal(symbol: str, db: Session = Depends(get_db)):
+    """
+    获取单个股票的买卖信号
+
+    基于技术指标（MA/MACD/RSI/KDJ/布林带）生成买入/卖出信号
+    """
+    import json
+    from .services.signals import generate_signal, format_signal_for_db
+    from .providers import get_coordinator
+
+    # 获取股票信息
+    db_stock = crud.get_stock_by_symbol(db, symbol=symbol)
+    if db_stock is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"股票 {symbol} 不存在"
+        )
+
+    # 获取 K 线数据
+    coordinator = get_coordinator()
+    normalized_code, market = services.normalize_symbol_for_sina(symbol)
+    kline_data, provider_name, _ = coordinator.get_kline_data(symbol, normalized_code, market, datalen=60)
+
+    if not kline_data:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="无法获取K线数据，请稍后重试"
+        )
+
+    # 转换为 DataFrame
+    import pandas as pd
+    df = pd.DataFrame(kline_data)
+    df['close'] = df['close'].astype(float)
+    df['high'] = df['high'].astype(float)
+    df['low'] = df['low'].astype(float)
+    df['open'] = df['open'].astype(float)
+
+    # 生成信号
+    signal_result = generate_signal(df, db_stock.current_price)
+    signal_result["current_price"] = db_stock.current_price
+
+    # 构建响应
+    return schemas.SignalResponse(
+        id=0,  # 临时ID，表示未持久化
+        stock_id=db_stock.id,
+        symbol=db_stock.symbol,
+        name=db_stock.name,
+        signal_date=date.today(),
+        signal_type=signal_result["signal_type"],
+        current_price=db_stock.current_price,
+        entry_price=signal_result.get("entry_price"),
+        stop_loss=signal_result.get("stop_loss"),
+        take_profit=signal_result.get("take_profit"),
+        strength=signal_result["strength"],
+        triggers=signal_result["triggers"],
+        indicators=signal_result.get("indicators", {}),
+        created_at=None
+    )
+
+
+@app.post("/signals/generate", response_model=schemas.SignalGenerateResponse, tags=["买卖信号"])
+def generate_signals(
+    request: schemas.SignalGenerateRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    批量生成买卖信号
+
+    为指定股票或所有股票生成信号并保存到数据库
+    """
+    import json
+    import pandas as pd
+    from .services.signals import generate_signal, format_signal_for_db
+    from .providers import get_coordinator
+
+    target_date = request.target_date or date.today()
+    stock_ids = request.stock_ids
+
+    # 获取股票列表
+    if stock_ids:
+        stocks = db.query(models.Stock).filter(models.Stock.id.in_(stock_ids)).all()
+    else:
+        stocks = db.query(models.Stock).all()
+
+    coordinator = get_coordinator()
+    generated_signals = []
+
+    for stock in stocks:
+        try:
+            # 获取 K 线数据
+            normalized_code, market = services.normalize_symbol_for_sina(stock.symbol)
+            kline_data, provider_name, _ = coordinator.get_kline_data(stock.symbol, normalized_code, market, datalen=60)
+
+            if not kline_data or len(kline_data) < 20:
+                logger.warning(f"[信号生成] K线数据不足 | 股票: {stock.symbol}")
+                continue
+
+            # 转换为 DataFrame
+            df = pd.DataFrame(kline_data)
+            df['close'] = df['close'].astype(float)
+            df['high'] = df['high'].astype(float)
+            df['low'] = df['low'].astype(float)
+            df['open'] = df['open'].astype(float)
+
+            # 生成信号
+            signal_result = generate_signal(df, stock.current_price)
+            signal_result["current_price"] = stock.current_price
+
+            # 保存到数据库
+            signal_data = format_signal_for_db(signal_result, stock.id, target_date)
+
+            # 检查是否已存在
+            existing = db.query(models.Signal).filter(
+                models.Signal.stock_id == stock.id,
+                models.Signal.signal_date == target_date
+            ).first()
+
+            if existing:
+                # 更新现有记录
+                for key, value in signal_data.items():
+                    if key not in ['stock_id', 'signal_date']:
+                        setattr(existing, key, value)
+            else:
+                # 创建新记录
+                new_signal = models.Signal(**signal_data)
+                db.add(new_signal)
+
+            # 添加到响应列表
+            generated_signals.append(schemas.SignalResponse(
+                id=existing.id if existing else 0,
+                stock_id=stock.id,
+                symbol=stock.symbol,
+                name=stock.name,
+                signal_date=target_date,
+                signal_type=signal_result["signal_type"],
+                current_price=stock.current_price,
+                entry_price=signal_result.get("entry_price"),
+                stop_loss=signal_result.get("stop_loss"),
+                take_profit=signal_result.get("take_profit"),
+                strength=signal_result["strength"],
+                triggers=signal_result["triggers"],
+                indicators=signal_result.get("indicators", {}),
+                created_at=None
+            ))
+
+        except Exception as e:
+            logger.error(f"[信号生成] 失败 | 股票: {stock.symbol} | 错误: {e}")
+            continue
+
+    db.commit()
+    logger.info(f"[信号生成] 完成 | 日期: {target_date} | 数量: {len(generated_signals)}")
+
+    return schemas.SignalGenerateResponse(
+        message=f"成功生成 {len(generated_signals)} 只股票的信号",
+        generated_count=len(generated_signals),
+        signals=generated_signals
+    )
+
+
+@app.get("/signals/", response_model=List[schemas.SignalResponse], tags=["买卖信号"])
+def list_signals(
+    signal_type: Optional[str] = Query(None, description="信号类型: buy/sell/hold"),
+    signal_date: Optional[date] = Query(None, description="信号日期"),
+    limit: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db)
+):
+    """
+    获取信号列表
+
+    支持按信号类型和日期筛选
+    """
+    query = db.query(models.Signal).join(models.Stock)
+
+    if signal_type:
+        query = query.filter(models.Signal.signal_type == signal_type)
+
+    if signal_date:
+        query = query.filter(models.Signal.signal_date == signal_date)
+    else:
+        # 默认获取今天的信号
+        query = query.filter(models.Signal.signal_date == date.today())
+
+    signals = query.order_by(models.Signal.strength.desc()).limit(limit).all()
+
+    result = []
+    for s in signals:
+        triggers = json.loads(s.triggers) if s.triggers else []
+        indicators = json.loads(s.indicators) if s.indicators else {}
+
+        result.append(schemas.SignalResponse(
+            id=s.id,
+            stock_id=s.stock_id,
+            symbol=s.stock.symbol,
+            name=s.stock.name,
+            signal_date=s.signal_date,
+            signal_type=s.signal_type,
+            current_price=s.current_price,
+            entry_price=s.entry_price,
+            stop_loss=s.stop_loss,
+            take_profit=s.take_profit,
+            strength=s.strength,
+            triggers=triggers,
+            indicators=indicators,
+            created_at=s.created_at
+        ))
+
+    return result
+
+
+# ============ 交易规则配置 API ============
+
+def _convert_rule_to_response(rule: models.TradingRule) -> schemas.TradingRuleResponse:
+    """将数据库规则对象转换为响应格式（解析 JSON 字符串）"""
+    conditions_data = json.loads(rule.conditions) if rule.conditions else []
+    price_config_data = json.loads(rule.price_config) if rule.price_config else {}
+
+    return schemas.TradingRuleResponse(
+        id=rule.id,
+        name=rule.name,
+        rule_type=rule.rule_type,
+        enabled=rule.enabled,
+        priority=rule.priority,
+        strength=rule.strength,
+        conditions=[schemas.ConditionConfig(**c) for c in conditions_data],
+        price_config=schemas.PriceConfig(**price_config_data),
+        description_template=rule.description_template,
+        created_at=rule.created_at,
+        updated_at=rule.updated_at
+    )
+
+
+@app.get("/rules/", response_model=List[schemas.TradingRuleResponse], tags=["交易规则"])
+def get_rules(
+    rule_type: Optional[str] = Query(None, description="规则类型: buy/sell"),
+    enabled_only: bool = Query(False, description="只返回启用的规则"),
+    db: Session = Depends(get_db)
+):
+    """
+    获取所有交易规则
+
+    支持按规则类型过滤，可选择只返回启用的规则
+    """
+    query = db.query(models.TradingRule)
+
+    if rule_type:
+        query = query.filter(models.TradingRule.rule_type == rule_type)
+
+    if enabled_only:
+        query = query.filter(models.TradingRule.enabled == True)
+
+    rules = query.order_by(models.TradingRule.priority.desc()).all()
+    return [_convert_rule_to_response(rule) for rule in rules]
+
+
+@app.get("/rules/{rule_id}", response_model=schemas.TradingRuleResponse, tags=["交易规则"])
+def get_rule(rule_id: int, db: Session = Depends(get_db)):
+    """获取单个交易规则"""
+    rule = db.query(models.TradingRule).filter(models.TradingRule.id == rule_id).first()
+    if not rule:
+        raise HTTPException(status_code=404, detail="规则不存在")
+    return _convert_rule_to_response(rule)
+
+
+@app.post("/rules/", response_model=schemas.TradingRuleResponse, tags=["交易规则"])
+def create_rule(rule: schemas.TradingRuleCreate, db: Session = Depends(get_db)):
+    """
+    创建新交易规则
+
+    规则创建后需要调用 /rules/recalculate 重新计算信号
+    """
+    # 验证 rule_type
+    if rule.rule_type not in ["buy", "sell"]:
+        raise HTTPException(status_code=400, detail="规则类型必须是 buy 或 sell")
+
+    # 验证 conditions 和 price_config 是有效的 JSON
+    try:
+        conditions = json.dumps([c.model_dump() for c in rule.conditions])
+        price_config = json.dumps(rule.price_config.model_dump())
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"配置格式错误: {str(e)}")
+
+    db_rule = models.TradingRule(
+        name=rule.name,
+        rule_type=rule.rule_type,
+        enabled=rule.enabled,
+        priority=rule.priority,
+        strength=rule.strength,
+        conditions=conditions,
+        price_config=price_config,
+        description_template=rule.description_template
+    )
+
+    db.add(db_rule)
+    db.commit()
+    db.refresh(db_rule)
+
+    logger.info(f"[规则创建] ID: {db_rule.id} | 名称: {db_rule.name} | 类型: {db_rule.rule_type}")
+
+    return _convert_rule_to_response(db_rule)
+
+
+@app.put("/rules/{rule_id}", response_model=schemas.TradingRuleResponse, tags=["交易规则"])
+def update_rule(rule_id: int, rule: schemas.TradingRuleUpdate, db: Session = Depends(get_db)):
+    """
+    更新交易规则
+
+    只更新请求中提供的字段
+    """
+    db_rule = db.query(models.TradingRule).filter(models.TradingRule.id == rule_id).first()
+    if not db_rule:
+        raise HTTPException(status_code=404, detail="规则不存在")
+
+    update_data = rule.model_dump(exclude_unset=True)
+
+    # 处理 conditions 和 price_config 的 JSON 序列化
+    if "conditions" in update_data and update_data["conditions"] is not None:
+        update_data["conditions"] = json.dumps([c.model_dump() for c in update_data["conditions"]])
+
+    if "price_config" in update_data and update_data["price_config"] is not None:
+        update_data["price_config"] = json.dumps(update_data["price_config"].model_dump())
+
+    for key, value in update_data.items():
+        setattr(db_rule, key, value)
+
+    db.commit()
+    db.refresh(db_rule)
+
+    logger.info(f"[规则更新] ID: {rule_id} | 更新字段: {list(update_data.keys())}")
+
+    return _convert_rule_to_response(db_rule)
+
+
+@app.delete("/rules/{rule_id}", tags=["交易规则"])
+def delete_rule(rule_id: int, db: Session = Depends(get_db)):
+    """删除交易规则"""
+    db_rule = db.query(models.TradingRule).filter(models.TradingRule.id == rule_id).first()
+    if not db_rule:
+        raise HTTPException(status_code=404, detail="规则不存在")
+
+    rule_name = db_rule.name
+    db.delete(db_rule)
+    db.commit()
+
+    logger.info(f"[规则删除] ID: {rule_id} | 名称: {rule_name}")
+
+    return {"message": f"规则 '{rule_name}' 已删除", "id": rule_id}
+
+
+@app.post("/rules/recalculate", response_model=schemas.RecalculateSignalsResponse, tags=["交易规则"])
+def recalculate_signals(
+    request: schemas.RecalculateSignalsRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    重新计算股票信号
+
+    使用当前启用的规则重新计算指定股票或所有股票的信号
+    """
+    from .services.signals import generate_signal, format_signal_for_db
+    from .providers import get_coordinator
+    import pandas as pd
+
+    target_date = request.target_date or date.today()
+    stock_ids = request.stock_ids
+
+    # 获取股票列表
+    if stock_ids:
+        stocks = db.query(models.Stock).filter(models.Stock.id.in_(stock_ids)).all()
+    else:
+        stocks = db.query(models.Stock).all()
+
+    # 获取启用的规则
+    rules = db.query(models.TradingRule).filter(models.TradingRule.enabled == True).all()
+
+    if not rules:
+        logger.warning("[信号重算] 没有启用的规则，跳过计算")
+        return schemas.RecalculateSignalsResponse(
+            message="没有启用的规则，无法计算信号",
+            total_stocks=0,
+            success_count=0,
+            error_count=0
+        )
+
+    coordinator = get_coordinator()
+    success_count = 0
+    error_count = 0
+
+    for stock in stocks:
+        try:
+            # 获取 K 线数据
+            normalized_code, market = services.normalize_symbol_for_sina(stock.symbol)
+            df = coordinator.get_kline_data(normalized_code, market, "daily", count=60)
+
+            if df is None or len(df) < 20:
+                logger.warning(f"[信号重算] 数据不足 | 股票: {stock.symbol}")
+                error_count += 1
+                continue
+
+            # 数据类型转换
+            df['close'] = df['close'].astype(float)
+            df['high'] = df['high'].astype(float)
+            df['low'] = df['low'].astype(float)
+            df['open'] = df['open'].astype(float)
+
+            # 使用规则引擎生成信号
+            signal_result = generate_signal(df, stock.current_price, rules=rules)
+            signal_result["current_price"] = stock.current_price
+
+            # 保存到数据库
+            signal_data = format_signal_for_db(signal_result, stock.id, target_date)
+
+            # 检查是否已存在
+            existing = db.query(models.Signal).filter(
+                models.Signal.stock_id == stock.id,
+                models.Signal.signal_date == target_date
+            ).first()
+
+            if existing:
+                for key, value in signal_data.items():
+                    setattr(existing, key, value)
+            else:
+                new_signal = models.Signal(**signal_data)
+                db.add(new_signal)
+
+            success_count += 1
+
+        except Exception as e:
+            logger.error(f"[信号重算] 失败 | 股票: {stock.symbol} | 错误: {e}")
+            error_count += 1
+            continue
+
+    db.commit()
+    logger.info(f"[信号重算] 完成 | 日期: {target_date} | 成功: {success_count} | 失败: {error_count}")
+
+    return schemas.RecalculateSignalsResponse(
+        message=f"信号重算完成，成功 {success_count} 只，失败 {error_count} 只",
+        total_stocks=len(stocks),
+        success_count=success_count,
+        error_count=error_count
+    )

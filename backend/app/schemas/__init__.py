@@ -79,6 +79,7 @@ class StockWithStatus(StockInDB):
     group_ids: List[int] = Field([], description="所属分组ID列表")
     is_realtime: bool = Field(False, description="数据是否为实时获取（非缓存）")
     data_fetched_at: Optional[datetime] = Field(None, description="数据获取时间")
+    signal: Optional["SignalBase"] = Field(None, description="最新买卖信号")
 
 
 class PriceUpdateResponse(BaseModel):
@@ -210,3 +211,147 @@ class BatchAssignGroupsResponse(BaseModel):
     skipped_count: int = Field(0, description="已在分组内跳过的股票数")
     created_groups: List[str] = Field(default_factory=list, description="新创建的分组名")
     message: str = Field(..., description="操作结果消息")
+
+
+# ============ 买卖信号相关模式 ============
+
+class SignalBase(BaseModel):
+    """买卖信号基础模式"""
+    signal_type: str = Field(..., description="信号类型: buy/sell/hold")
+    current_price: Optional[float] = Field(None, description="当前价格")
+    entry_price: Optional[float] = Field(None, description="建议买入/卖出价位")
+    stop_loss: Optional[float] = Field(None, description="止损价位")
+    take_profit: Optional[float] = Field(None, description="目标价位")
+    strength: int = Field(0, ge=0, le=5, description="信号强度 0-5（0=持有观望）")
+    triggers: List[str] = Field(default_factory=list, description="触发条件列表")
+    indicators: Dict = Field(default_factory=dict, description="指标快照")
+
+
+class SignalInDB(SignalBase):
+    """数据库中的信号模式"""
+    id: int
+    stock_id: int
+    symbol: str = Field(..., description="股票代码")
+    name: str = Field(..., description="股票名称")
+    signal_date: date
+    created_at: Optional[datetime] = Field(None, description="创建时间")
+
+    class Config:
+        from_attributes = True
+
+
+class SignalResponse(SignalInDB):
+    """信号响应模式（包含股票信息）"""
+    pass
+
+
+class SignalGenerateRequest(BaseModel):
+    """生成信号请求"""
+    stock_ids: Optional[List[int]] = Field(None, description="指定股票ID列表，为空则生成所有")
+    target_date: Optional[date] = Field(None, description="目标日期，默认今天")
+
+
+class SignalGenerateResponse(BaseModel):
+    """生成信号响应"""
+    message: str
+    generated_count: int = Field(..., description="生成的信号数量")
+    signals: List[SignalResponse] = Field(default_factory=list, description="生成的信号列表")
+
+
+# 解决前向引用
+StockWithStatus.model_rebuild()
+
+
+# ============ 交易规则配置相关模式 ============
+
+class ConditionConfig(BaseModel):
+    """单个触发条件配置"""
+    indicator: str = Field(..., description="指标类型: MA/MACD/RSI/KDJ/Bollinger")
+    field: str = Field(..., description="字段名，如 MA5, RSI, DIF 等")
+    operator: str = Field(..., description="操作符: gt/lt/gte/lte/eq/cross_above/cross_below/below_threshold/above_threshold")
+    target_type: str = Field(..., description="目标类型: indicator/value")
+    target_indicator: Optional[str] = Field(None, description="目标指标类型（当 target_type=indicator 时）")
+    target_field: Optional[str] = Field(None, description="目标字段名（当 target_type=indicator 时）")
+    target_value: Optional[float] = Field(None, description="目标值（当 target_type=value 时）")
+
+
+class PriceEntryConfig(BaseModel):
+    """入场价配置"""
+    type: str = Field(..., description="类型: indicator/percentage/current")
+    indicator: Optional[str] = Field(None, description="指标类型（当 type=indicator 时）")
+    field: Optional[str] = Field(None, description="字段名（当 type=indicator 时）")
+    value: Optional[float] = Field(None, description="百分比值（当 type=percentage 时）")
+
+
+class PriceExitConfig(BaseModel):
+    """止损/止盈价配置"""
+    type: str = Field(..., description="类型: indicator/percentage")
+    base: Optional[str] = Field(None, description="基准: entry/current（当 type=percentage 时）")
+    value: Optional[float] = Field(None, description="百分比值（当 type=percentage 时）")
+    indicator: Optional[str] = Field(None, description="指标类型（当 type=indicator 时）")
+    field: Optional[str] = Field(None, description="字段名（当 type=indicator 时）")
+
+
+class PriceConfig(BaseModel):
+    """价位配置"""
+    entry: PriceEntryConfig = Field(..., description="入场价配置")
+    stop_loss: Optional[PriceExitConfig] = Field(None, description="止损价配置")
+    take_profit: Optional[PriceExitConfig] = Field(None, description="止盈价配置")
+
+
+class TradingRuleBase(BaseModel):
+    """交易规则基础模式"""
+    name: str = Field(..., description="规则名称", max_length=100)
+    rule_type: str = Field(..., description="规则类型: buy/sell")
+    enabled: bool = Field(True, description="是否启用")
+    priority: int = Field(0, ge=0, description="优先级(越大越优先)")
+    strength: int = Field(2, ge=1, le=5, description="信号强度1-5")
+    conditions: List[ConditionConfig] = Field(..., description="触发条件列表")
+    price_config: PriceConfig = Field(..., description="价位配置")
+    description_template: Optional[str] = Field(None, description="描述模板", max_length=500)
+
+
+class TradingRuleCreate(TradingRuleBase):
+    """创建交易规则的请求模式"""
+    pass
+
+
+class TradingRuleUpdate(BaseModel):
+    """更新交易规则的请求模式"""
+    name: Optional[str] = Field(None, description="规则名称", max_length=100)
+    rule_type: Optional[str] = Field(None, description="规则类型: buy/sell")
+    enabled: Optional[bool] = Field(None, description="是否启用")
+    priority: Optional[int] = Field(None, ge=0, description="优先级(越大越优先)")
+    strength: Optional[int] = Field(None, ge=1, le=5, description="信号强度1-5")
+    conditions: Optional[List[ConditionConfig]] = Field(None, description="触发条件列表")
+    price_config: Optional[PriceConfig] = Field(None, description="价位配置")
+    description_template: Optional[str] = Field(None, description="描述模板", max_length=500)
+
+
+class TradingRuleInDB(TradingRuleBase):
+    """数据库中的交易规则模式"""
+    id: int
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class TradingRuleResponse(TradingRuleInDB):
+    """交易规则响应模式"""
+    pass
+
+
+class RecalculateSignalsRequest(BaseModel):
+    """重新计算信号请求"""
+    stock_ids: Optional[List[int]] = Field(None, description="指定股票ID列表，为空则重算所有")
+    target_date: Optional[date] = Field(None, description="目标日期，默认今天")
+
+
+class RecalculateSignalsResponse(BaseModel):
+    """重新计算信号响应"""
+    message: str
+    total_stocks: int = Field(..., description="处理的股票总数")
+    success_count: int = Field(..., description="成功生成信号的股票数")
+    error_count: int = Field(0, description="处理失败的股票数")

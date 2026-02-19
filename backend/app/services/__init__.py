@@ -15,6 +15,9 @@ from cachetools import TTLCache
 # 导入数据源协调器
 from ..providers import get_coordinator
 
+# 导入信号生成服务
+from .signals import generate_signal
+
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
 
@@ -900,6 +903,34 @@ def enrich_stock_with_status(stock: Stock, force_refresh: bool = False, db = Non
     first_ma = ma_types_list[0] if ma_types_list else "MA5"
     main_res = ma_results.get(first_ma)
 
+    # 生成买卖信号（使用 K 线数据）
+    signal_data = None
+    if kline_closes and len(kline_closes) >= 20:
+        try:
+            import pandas as pd
+            # 构建 DataFrame 用于信号计算
+            kline_df = pd.DataFrame({
+                'open': kline_closes,
+                'high': kline_closes,
+                'low': kline_closes,
+                'close': kline_closes,
+                'volume': [0] * len(kline_closes)
+            })
+            signal_result = generate_signal(kline_df, current_price)
+            # 只保留前端需要的字段
+            signal_data = {
+                'signal_type': signal_result['signal_type'],
+                'strength': signal_result['strength'],
+                'entry_price': signal_result.get('entry_price'),
+                'stop_loss': signal_result.get('stop_loss'),
+                'take_profit': signal_result.get('take_profit'),
+                'triggers': signal_result.get('triggers', []),
+                'message': signal_result.get('message', '')
+            }
+            logger.debug(f"[信号生成] 股票: {stock.symbol} | 信号: {signal_result['signal_type']} | 强度: {signal_result['strength']}")
+        except Exception as e:
+            logger.warning(f"[信号生成] 失败 | 股票: {stock.symbol} | 错误: {e}")
+
     return StockWithStatus(
         id=stock.id,
         symbol=stock.symbol,
@@ -916,7 +947,8 @@ def enrich_stock_with_status(stock: Stock, force_refresh: bool = False, db = Non
         price_difference=main_res.price_difference if main_res else None,
         price_difference_percent=main_res.price_difference_percent if main_res else None,
         is_realtime=is_realtime,
-        data_fetched_at=data_fetched_at
+        data_fetched_at=data_fetched_at,
+        signal=signal_data
     )
 
 
@@ -940,24 +972,54 @@ def enrich_stocks_batch(stocks: List[Stock], force_refresh: bool = False, max_wo
     batch_start = time.time()
     logger.info(f"[批量富化] 开始处理 {len(stocks)} 只股票 | 并发数: {max_workers} | 强制刷新: {force_refresh} | 需要计算: {need_calc}")
 
+    # ========== 线程安全修复：在主线程中预先计算所有需要 db 的数据 ==========
+    # 1. 预先计算每个市场的交易日状态（避免子线程访问 db）
+    trading_day_cache = {}
+    realtime_cache = {}
+    for market in ["cn", "us"]:
+        if market == "cn" and db is not None:
+            trading_day_cache[market] = is_trading_day(db)
+        else:
+            trading_day_cache[market] = (True, "美股或无数据库连接")
+        # 预计算是否为真正的交易时间（交易日 + 交易时间段）
+        realtime_cache[market] = is_real_trading_time(market, db=db)
+
+    # 2. 预加载所有股票的 groups 数据（避免子线程懒加载 relationship）
+    stocks_data = []
+    for stock in stocks:
+        stocks_data.append({
+            'stock': stock,
+            'group_ids': [g.id for g in stock.groups] if stock.groups else [],
+            'group_names': [g.name for g in stock.groups] if stock.groups else [],
+        })
+
     results = [None] * len(stocks)  # 预分配结果列表，保持顺序
 
-    def process_stock(index, stock):
-        """处理单只股票并返回带索引的结果"""
+    def process_stock(index, stock_data):
+        """处理单只股票并返回带索引的结果（线程安全版本）"""
         try:
-            result = enrich_stock_with_status(stock, force_refresh=force_refresh, db=db, need_calc=need_calc)
+            stock = stock_data['stock']
+            result = _enrich_stock_with_status_threadsafe(
+                stock=stock,
+                group_ids=stock_data['group_ids'],
+                group_names=stock_data['group_names'],
+                force_refresh=force_refresh,
+                need_calc=need_calc,
+                trading_day_cache=trading_day_cache,
+                realtime_cache=realtime_cache
+            )
             return (index, result)
         except Exception as e:
             import traceback
-            logger.error(f"[批量富化] 处理失败 | 股票: {stock.symbol} | 错误: {e}\n{traceback.format_exc()}")
+            logger.error(f"[批量富化] 处理失败 | 股票: {stock_data['stock'].symbol} | 错误: {e}\n{traceback.format_exc()}")
             return (index, None)
 
     # 使用线程池并发处理
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # 提交所有任务
         futures = {
-            executor.submit(process_stock, i, stock): i
-            for i, stock in enumerate(stocks)
+            executor.submit(process_stock, i, stock_data): i
+            for i, stock_data in enumerate(stocks_data)
         }
 
         # 收集结果
@@ -976,6 +1038,311 @@ def enrich_stocks_batch(stocks: List[Stock], force_refresh: bool = False, max_wo
     logger.info(f"[批量富化] 处理完成 | 成功: {len(valid_results)}/{len(stocks)} | 总耗时: {batch_elapsed:.0f}ms | 平均: {batch_elapsed/len(stocks):.0f}ms/只")
 
     return valid_results
+
+
+def _enrich_stock_with_status_threadsafe(
+    stock: Stock,
+    group_ids: List[int],
+    group_names: List[str],
+    force_refresh: bool = False,
+    need_calc: bool = False,
+    trading_day_cache: dict = None,
+    realtime_cache: dict = None
+) -> StockWithStatus:
+    """
+    线程安全版本的 enrich_stock_with_status
+
+    与 enrich_stock_with_status 的区别：
+    - 不访问 db 参数
+    - 使用预计算的 trading_day_cache 和 realtime_cache
+    - 使用预加载的 group_ids 和 group_names
+
+    Args:
+        stock: 股票对象
+        group_ids: 预加载的分组ID列表
+        group_names: 预加载的分组名称列表
+        force_refresh: 是否强制刷新（绕过缓存），默认 False
+        need_calc: 是否需要计算（新增股票/指标时为True）
+        trading_day_cache: 预计算的交易日状态缓存 {"cn": (bool, str), "us": (bool, str)}
+        realtime_cache: 预计算的实时状态缓存 {"cn": bool, "us": bool}
+
+    Returns:
+        StockWithStatus: 包含状态信息的股票对象
+    """
+    from ..schemas import MAResult
+
+    # 获取市场类型
+    _, market = normalize_symbol_for_sina(stock.symbol)
+
+    # 智能缓存决策：判断是否需要获取数据（使用预计算缓存）
+    need_fetch_data = False
+    is_realtime = False
+    refresh_reason = ""
+    data_fetched_at = None  # 数据获取时间
+
+    if force_refresh:
+        need_fetch_data = True
+        # 使用预计算的实时状态
+        is_realtime = realtime_cache.get(market, False) if realtime_cache else False
+        refresh_reason = "强制刷新"
+    else:
+        # 使用预计算的交易日状态判断是否需要刷新
+        need_refresh, refresh_reason = _should_refresh_price_threadsafe(
+            stock, market, need_calc, trading_day_cache
+        )
+        if need_refresh:
+            need_fetch_data = True
+            # 使用预计算的实时状态
+            is_realtime = realtime_cache.get(market, False) if realtime_cache else False
+
+    logger.info(f"[数据富化] 开始处理 | 股票: {stock.symbol} ({stock.name}) | 指标: {stock.ma_types} | 实时模式: {is_realtime} | 获取数据: {need_fetch_data} | 原因: {refresh_reason}")
+    enrich_start = time.time()
+
+    # 解析 ma_types，过滤无效值
+    if stock.ma_types and stock.ma_types.strip():
+        ma_types_list = [ma.strip() for ma in stock.ma_types.split(",") if ma.strip()]
+    else:
+        ma_types_list = []
+
+    # 如果没有有效的 ma_types，使用默认值
+    if not ma_types_list:
+        ma_types_list = ["MA5"]
+        logger.warning(f"[数据富化] 指标为空，使用默认值 MA5 | 股票: {stock.symbol}")
+
+    ma_results = {}
+
+    # 根据智能缓存决策获取数据
+    if need_fetch_data:
+        # 【获取数据模式】请求 API 获取最新数据
+        # 交易时间内不缓存，确保数据实时性
+        current_price, _ = fetch_realtime_data(stock.symbol, use_cache=False, is_trading_time=is_realtime)
+        # 记录数据获取时间
+        data_fetched_at = datetime.now(ZoneInfo("Asia/Shanghai"))
+    else:
+        # 【缓存模式】使用数据库中已有的价格
+        current_price = stock.current_price
+        # 缓存模式下，使用数据库的 updated_at 作为数据获取时间
+        data_fetched_at = stock.updated_at
+
+        # 【修复】如果缓存价格为 None 或 0，强制重新获取
+        if current_price is None or current_price <= 0:
+            logger.warning(f"[智能缓存] 缓存价格无效，强制刷新 | 股票: {stock.symbol} | 缓存价格: {current_price}")
+            current_price, _ = fetch_realtime_data(stock.symbol, use_cache=False, is_trading_time=is_realtime)
+            # 使用预计算的实时状态
+            is_realtime = realtime_cache.get(market, False) if realtime_cache else False
+            # 重新获取数据后，更新获取时间
+            data_fetched_at = datetime.now(ZoneInfo("Asia/Shanghai"))
+        else:
+            logger.info(f"[智能缓存] 使用缓存数据 | 股票: {stock.symbol} | 价格: {current_price}")
+
+    # 【优化2】一次获取足够多的 K 线数据（取最大周期），避免每个 MA 类型重复请求
+    # 安全提取 MA 周期数字
+    ma_periods = []
+    for ma in ma_types_list:
+        match = re.search(r'\d+', ma)
+        if match:
+            ma_periods.append(int(match.group()))
+        else:
+            logger.warning(f"[数据富化] 无效的指标格式: {ma} | 股票: {stock.symbol}")
+
+    # 如果没有有效的周期，使用默认值 5
+    max_ma_period = max(ma_periods) if ma_periods else 5
+
+    normalized_code, _ = normalize_symbol_for_sina(stock.symbol)
+    kline_closes = None
+
+    # K线缓存键：股票代码:日期:最大周期（确保不同指标组合使用独立缓存）
+    cache_key = f"{stock.symbol}:{date.today()}:{max_ma_period}"
+
+    # 检查 K 线缓存（仅在非实时模式下使用缓存）
+    if not is_realtime and cache_key in kline_cache:
+        logger.info(f"[K线数据] 缓存命中 | 股票: {stock.symbol} | 周期: {max_ma_period}")
+        kline_closes = kline_cache[cache_key]
+    else:
+        # 缓存未命中或实时模式，使用协调器请求 API
+        datalen = max_ma_period + 2
+        coordinator = get_coordinator()
+        kline_data, provider_name, tried_providers = coordinator.get_kline_data(
+            stock.symbol, normalized_code, market, datalen
+        )
+
+        if kline_data:
+            try:
+                # 【修复】过滤无效的 close 值，避免 None 或空字符串导致后续计算错误
+                kline_closes = []
+                for item in kline_data:
+                    close_val = item.get('close')
+                    if close_val is not None and close_val != '' and close_val != 0:
+                        try:
+                            kline_closes.append(float(close_val))
+                        except (ValueError, TypeError):
+                            pass  # 跳过无效数据
+
+                # 【修正】根据交易时间决定是否加入实时价格到 MA 计算
+                # 交易时间内：加入实时价格，MA 动态计算
+                # 非交易时间：只用历史 K 线收盘价
+                if is_realtime and current_price is not None and current_price > 0:
+                    kline_closes.append(current_price)
+                    logger.info(f"[MA计算] 交易时间内，实时价格加入MA计算 | 股票: {stock.symbol} | 实时价格: {current_price}")
+
+                # 存入缓存（仅当有有效数据且非实时模式时）
+                if kline_closes and not is_realtime:
+                    kline_cache[cache_key] = kline_closes
+                logger.info(f"[K线数据] 获取成功 | 股票: {stock.symbol} | 数据源: {provider_name} | K线数量: {len(kline_closes)}")
+            except Exception as e:
+                logger.error(f"[K线数据] 解析异常 | 股票: {stock.symbol} | 错误: {e}")
+
+    # 【新增】如果实时价格获取失败（停牌、退市等），使用 K 线历史数据的最后收盘价
+    if current_price is None and kline_closes and len(kline_closes) > 0:
+        current_price = kline_closes[-1]
+        logger.info(f"[历史数据兜底] 使用 K 线最后收盘价 | 股票: {stock.symbol} | 价格: {current_price}")
+
+    # 【优化3】本地计算所有 MA 值（无需再次请求 API）
+    for ma_type in ma_types_list:
+        ma_period = int(re.search(r'\d+', ma_type).group())
+        res = MAResult(reached_target=False)
+
+        if current_price is not None and kline_closes and len(kline_closes) >= ma_period:
+            final_closes = kline_closes[-ma_period:]
+            # 【安全检查】过滤掉可能的 None 值
+            final_closes = [c for c in final_closes if c is not None]
+
+            if len(final_closes) >= ma_period:
+                ma_val = round(sum(final_closes) / ma_period, 2)
+            else:
+                ma_val = None
+
+            if ma_val is not None and ma_val > 0:
+                diff = current_price - ma_val
+                res = MAResult(
+                    ma_price=ma_val,
+                    reached_target=current_price >= ma_val,
+                    price_difference=round(diff, 2),
+                    price_difference_percent=round((diff / ma_val) * 100, 2)
+                )
+                status = "✅达标" if res.reached_target else "⏳未达"
+                logger.debug(f"[MA计算] {ma_type}: {ma_val} | 当前价: {current_price} | 偏离: {diff:.2f} ({res.price_difference_percent:.2f}%) | {status}")
+
+        ma_results[ma_type] = res
+
+    # 汇总日志
+    enrich_elapsed = (time.time() - enrich_start) * 1000
+    reached_count = sum(1 for r in ma_results.values() if r.reached_target)
+    logger.info(f"[数据富化] 处理完成 | 股票: {stock.symbol} | 当前价: {current_price} | 达标: {reached_count}/{len(ma_types_list)} | 实时: {is_realtime} | 总耗时: {enrich_elapsed:.0f}ms")
+
+    # 为了兼容前端或作为汇总展示，取第一个指标的结果作为汇总字段
+    first_ma = ma_types_list[0] if ma_types_list else "MA5"
+    main_res = ma_results.get(first_ma)
+
+    # 生成买卖信号（使用 K 线数据）
+    signal_data = None
+    if kline_closes and len(kline_closes) >= 20:
+        try:
+            import pandas as pd
+            # 构建 DataFrame 用于信号计算
+            kline_df = pd.DataFrame({
+                'open': kline_closes,
+                'high': kline_closes,
+                'low': kline_closes,
+                'close': kline_closes,
+                'volume': [0] * len(kline_closes)
+            })
+            signal_result = generate_signal(kline_df, current_price)
+            # 只保留前端需要的字段
+            signal_data = {
+                'signal_type': signal_result['signal_type'],
+                'strength': signal_result['strength'],
+                'entry_price': signal_result.get('entry_price'),
+                'stop_loss': signal_result.get('stop_loss'),
+                'take_profit': signal_result.get('take_profit'),
+                'triggers': signal_result.get('triggers', []),
+                'message': signal_result.get('message', '')
+            }
+            logger.debug(f"[信号生成] 股票: {stock.symbol} | 信号: {signal_result['signal_type']} | 强度: {signal_result['strength']}")
+        except Exception as e:
+            logger.warning(f"[信号生成] 失败 | 股票: {stock.symbol} | 错误: {e}")
+
+    return StockWithStatus(
+        id=stock.id,
+        symbol=stock.symbol,
+        name=stock.name,
+        ma_types=ma_types_list,
+        ma_results=ma_results,
+        group_ids=group_ids,
+        group_names=group_names,
+        ma_price=main_res.ma_price if main_res else None,
+        current_price=current_price or stock.current_price,
+        created_at=stock.created_at,
+        updated_at=stock.updated_at,
+        reached_target=main_res.reached_target if main_res else False,
+        price_difference=main_res.price_difference if main_res else None,
+        price_difference_percent=main_res.price_difference_percent if main_res else None,
+        is_realtime=is_realtime,
+        data_fetched_at=data_fetched_at,
+        signal=signal_data
+    )
+
+
+def _should_refresh_price_threadsafe(
+    stock: Stock,
+    market: str,
+    need_calc: bool,
+    trading_day_cache: dict = None
+) -> Tuple[bool, str]:
+    """
+    线程安全版本的 should_refresh_price
+
+    使用预计算的 trading_day_cache 代替 db 访问
+
+    Args:
+        stock: 股票对象
+        market: 市场类型 ("cn" 或 "us")
+        need_calc: 是否需要计算（新增股票/指标时为True）
+        trading_day_cache: 预计算的交易日状态缓存
+
+    Returns:
+        Tuple[bool, str]: (是否需要刷新, 原因说明)
+    """
+    # 1. 如果需要计算（新增股票/指标），直接获取数据
+    if need_calc:
+        return True, "新增股票或指标变更，获取最近交易日数据"
+
+    # 2. 判断是否为交易日（使用预计算缓存）
+    if trading_day_cache and market in trading_day_cache:
+        is_trading, reason = trading_day_cache[market]
+        if not is_trading:
+            # 非交易日，不刷新，使用缓存
+            return False, f"非交易日（{reason}），使用缓存数据"
+
+    # 3. 如果在交易时间内，刷新获取实时数据
+    if is_trading_time(market):
+        return True, "交易时间内，实时获取最新价格"
+
+    # 4. 非交易时间，检查是否需要更新收盘数据
+    # 如果当前价格为空，需要获取
+    if stock.current_price is None:
+        return True, "当前价格为空，需要获取"
+
+    # 检查数据是否已是最新的收盘数据
+    if stock.updated_at is None:
+        return True, "更新时间为空，需要获取"
+
+    # 确保 stock.updated_at 是 timezone-aware
+    beijing_tz = ZoneInfo("Asia/Shanghai")
+    if stock.updated_at.tzinfo is None:
+        # 假设数据库存储的是 UTC 时间
+        last_update = stock.updated_at.replace(tzinfo=timezone.utc)
+    else:
+        last_update = stock.updated_at
+
+    # 获取最近交易日收盘时间
+    last_close_time = get_last_trading_day_close()
+
+    # 如果更新时间早于最近收盘时间，需要刷新
+    if last_update.astimezone(beijing_tz) < last_close_time:
+        return True, f"数据过期，上次更新: {last_update.astimezone(beijing_tz).strftime('%Y-%m-%d %H:%M')}"
+
+    return False, f"数据已是最新收盘数据，更新于: {last_update.astimezone(beijing_tz).strftime('%Y-%m-%d %H:%M')}"
 
 
 # ============ 快照和报告服务 ============

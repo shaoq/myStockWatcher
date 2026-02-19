@@ -242,6 +242,82 @@ export const stockApi = {
     const response = await apiClient.get("/reports/daily", { params });
     return response.data;
   },
+
+  // --- 买卖信号 ---
+
+  // 获取单个股票的信号
+  getStockSignal: async (symbol) => {
+    const response = await apiClient.get(`/stocks/${symbol}/signal`);
+    return response.data;
+  },
+
+  // 批量生成信号
+  generateSignals: async (stockIds = null, targetDate = null) => {
+    const data = {};
+    if (stockIds) data.stock_ids = stockIds;
+    if (targetDate) data.target_date = targetDate;
+    const response = await apiClient.post("/signals/generate", data);
+    return response.data;
+  },
+
+  // 获取信号列表
+  getSignals: async (
+    signalType = null,
+    targetDate = null,
+    page = 1,
+    pageSize = 20,
+  ) => {
+    const params = { page, page_size: pageSize };
+    if (signalType) params.signal_type = signalType;
+    if (targetDate) params.signal_date = targetDate;
+    const response = await apiClient.get("/signals/", { params });
+    return response.data;
+  },
+};
+
+// 交易规则API服务
+export const ruleApi = {
+  // 获取所有规则
+  getRules: async (ruleType = null, enabledOnly = false) => {
+    const params = {};
+    if (ruleType) params.rule_type = ruleType;
+    if (enabledOnly) params.enabled_only = true;
+    const response = await apiClient.get("/rules/", { params });
+    return response.data;
+  },
+
+  // 获取单个规则
+  getRule: async (ruleId) => {
+    const response = await apiClient.get(`/rules/${ruleId}`);
+    return response.data;
+  },
+
+  // 创建规则
+  createRule: async (ruleData) => {
+    const response = await apiClient.post("/rules/", ruleData);
+    return response.data;
+  },
+
+  // 更新规则
+  updateRule: async (ruleId, ruleData) => {
+    const response = await apiClient.put(`/rules/${ruleId}`, ruleData);
+    return response.data;
+  },
+
+  // 删除规则
+  deleteRule: async (ruleId) => {
+    const response = await apiClient.delete(`/rules/${ruleId}`);
+    return response.data;
+  },
+
+  // 重新计算信号
+  recalculateSignals: async (stockIds = null, targetDate = null) => {
+    const data = {};
+    if (stockIds) data.stock_ids = stockIds;
+    if (targetDate) data.target_date = targetDate;
+    const response = await apiClient.post("/rules/recalculate", data);
+    return response.data;
+  },
 };
 
 export default apiClient;

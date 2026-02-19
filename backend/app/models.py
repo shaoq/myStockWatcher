@@ -1,5 +1,5 @@
 """数据库模型定义"""
-from sqlalchemy import Column, Integer, String, Float, DateTime, Date, ForeignKey, Table, Text
+from sqlalchemy import Column, Integer, String, Float, DateTime, Date, ForeignKey, Table, Text, Boolean
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from .database import Base
@@ -82,3 +82,55 @@ class TradingCalendar(Base):
     def __repr__(self):
         status = "交易日" if self.is_trading_day else "非交易日"
         return f"<TradingCalendar {self.trade_date}: {status}>"
+
+
+class Signal(Base):
+    """买卖信号模型 - 存储技术分析生成的信号"""
+    __tablename__ = "signals"
+
+    id = Column(Integer, primary_key=True, index=True)
+    stock_id = Column(Integer, ForeignKey("stocks.id", ondelete="CASCADE"), nullable=False, comment="关联股票ID")
+    signal_date = Column(Date, nullable=False, index=True, comment="信号日期")
+    signal_type = Column(String(10), nullable=False, comment="信号类型: buy/sell/hold")
+    current_price = Column(Float, nullable=True, comment="当前价格")
+
+    # 价位建议
+    entry_price = Column(Float, nullable=True, comment="建议买入/卖出价位")
+    stop_loss = Column(Float, nullable=True, comment="止损价位")
+    take_profit = Column(Float, nullable=True, comment="目标价位")
+
+    # 信号详情
+    strength = Column(Integer, default=1, comment="信号强度 1-5")
+    triggers = Column(Text, nullable=True, comment="触发条件列表(JSON)")
+    indicators = Column(Text, nullable=True, comment="指标快照(JSON)")
+
+    created_at = Column(DateTime, default=datetime.utcnow, comment="创建时间")
+
+    # 建立与股票的关联
+    stock = relationship("Stock", backref="signals")
+
+    def __repr__(self):
+        return f"<Signal {self.stock_id}:{self.signal_date} [{self.signal_type}]>"
+
+
+class TradingRule(Base):
+    """交易规则配置模型 - 存储用户自定义的买卖规则"""
+    __tablename__ = "trading_rules"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), nullable=False, comment="规则名称")
+    rule_type = Column(String(10), nullable=False, comment="规则类型: buy/sell")
+    enabled = Column(Boolean, default=True, comment="是否启用")
+    priority = Column(Integer, default=0, comment="优先级(越大越优先)")
+    strength = Column(Integer, default=2, comment="信号强度1-5")
+
+    # JSON 配置
+    conditions = Column(Text, nullable=False, comment="触发条件(JSON)")
+    price_config = Column(Text, nullable=False, comment="价位配置(JSON)")
+    description_template = Column(String(500), comment="描述模板")
+
+    created_at = Column(DateTime, default=datetime.utcnow, comment="创建时间")
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, comment="更新时间")
+
+    def __repr__(self):
+        return f"<TradingRule {self.id}: {self.name} [{self.rule_type}]>"

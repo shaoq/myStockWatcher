@@ -19,9 +19,11 @@ import {
   GlobalOutlined,
   DeleteOutlined,
   BarChartOutlined,
+  SettingOutlined,
 } from "@ant-design/icons";
 import StockList from "./components/StockList";
 import DailyReport from "./components/DailyReport";
+import TradingRules from "./components/TradingRules";
 import { stockApi } from "./services/api";
 import "./App.css";
 
@@ -127,6 +129,11 @@ function App() {
       icon: <BarChartOutlined />,
       label: "每日报告",
     },
+    {
+      key: "trading-rules",
+      icon: <SettingOutlined />,
+      label: "规则配置",
+    },
   ];
 
   return (
@@ -176,6 +183,8 @@ function App() {
           <Content style={{ padding: "24px" }}>
             {selectedGroupId === "daily-report" ? (
               <DailyReport />
+            ) : selectedGroupId === "trading-rules" ? (
+              <TradingRules />
             ) : (
               <div
                 style={{

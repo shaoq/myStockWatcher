@@ -24,6 +24,13 @@ import {
   CalendarTwoTone,
   DollarOutlined,
   WarningOutlined,
+  RiseOutlined,
+  FallOutlined,
+  PauseOutlined,
+  AimOutlined,
+  StopOutlined,
+  TrophyOutlined,
+  ThunderboltOutlined,
 } from "@ant-design/icons";
 import { stockApi } from "../services/api";
 
@@ -64,11 +71,36 @@ const CHART_DESCRIPTIONS = {
  * 核心估值指标配置
  */
 const CORE_METRICS = [
-  { key: "pe_ratio", label: "PE", subLabel: "市盈率", format: (v) => v?.toFixed(2) ?? "-" },
-  { key: "pb_ratio", label: "PB", subLabel: "市净率", format: (v) => v?.toFixed(2) ?? "-" },
-  { key: "roe", label: "ROE", subLabel: "净资产收益率", format: (v) => v != null ? `${(v * 100).toFixed(1)}%` : "-" },
-  { key: "profit_margin", label: "利润率", subLabel: "净利润率", format: (v) => v != null ? `${(v * 100).toFixed(1)}%` : "-" },
-  { key: "revenue_growth", label: "营收增", subLabel: "营收增长率", format: (v) => v != null ? `${(v * 100).toFixed(1)}%` : "-" },
+  {
+    key: "pe_ratio",
+    label: "PE",
+    subLabel: "市盈率",
+    format: (v) => v?.toFixed(2) ?? "-",
+  },
+  {
+    key: "pb_ratio",
+    label: "PB",
+    subLabel: "市净率",
+    format: (v) => v?.toFixed(2) ?? "-",
+  },
+  {
+    key: "roe",
+    label: "ROE",
+    subLabel: "净资产收益率",
+    format: (v) => (v != null ? `${(v * 100).toFixed(1)}%` : "-"),
+  },
+  {
+    key: "profit_margin",
+    label: "利润率",
+    subLabel: "净利润率",
+    format: (v) => (v != null ? `${(v * 100).toFixed(1)}%` : "-"),
+  },
+  {
+    key: "revenue_growth",
+    label: "营收增",
+    subLabel: "营收增长率",
+    format: (v) => (v != null ? `${(v * 100).toFixed(1)}%` : "-"),
+  },
 ];
 
 /**
@@ -85,6 +117,11 @@ const StockChart = ({ symbol, name }) => {
   const [valuation, setValuation] = useState(null);
   const [valuationLoading, setValuationLoading] = useState(false);
   const [valuationError, setValuationError] = useState(null);
+
+  // 买卖信号状态
+  const [signal, setSignal] = useState(null);
+  const [signalLoading, setSignalLoading] = useState(false);
+  const [signalError, setSignalError] = useState(null);
 
   // 获取图表数据
   useEffect(() => {
@@ -127,6 +164,27 @@ const StockChart = ({ symbol, name }) => {
     fetchValuation();
   }, [symbol]);
 
+  // 并行加载信号数据
+  useEffect(() => {
+    const fetchSignal = async () => {
+      if (!symbol) return;
+
+      setSignalLoading(true);
+      setSignalError(null);
+      try {
+        const data = await stockApi.getStockSignal(symbol);
+        setSignal(data);
+      } catch (error) {
+        setSignalError(error.message || "信号数据获取失败");
+        setSignal(null);
+      } finally {
+        setSignalLoading(false);
+      }
+    };
+
+    fetchSignal();
+  }, [symbol]);
+
   // 图片展示组件
   const ChartImage = ({ src, alt }) => (
     <div style={{ textAlign: "center", padding: "10px" }}>
@@ -161,7 +219,9 @@ const StockChart = ({ symbol, name }) => {
       return (
         <Alert
           message="估值数据获取失败"
-          description={valuationError || "暂无估值数据，美股暂不支持 AKShare 估值数据"}
+          description={
+            valuationError || "暂无估值数据，美股暂不支持 AKShare 估值数据"
+          }
           type="warning"
           showIcon
           icon={<WarningOutlined />}
@@ -203,6 +263,149 @@ const StockChart = ({ symbol, name }) => {
     );
   };
 
+  // 买卖信号卡片
+  const SignalCard = () => {
+    if (signalLoading) {
+      return (
+        <Card size="small" style={{ marginBottom: 16 }}>
+          <Skeleton active paragraph={{ rows: 1 }} />
+        </Card>
+      );
+    }
+
+    if (signalError || !signal) {
+      return null; // 静默处理，不显示错误
+    }
+
+    const signalConfig = {
+      buy: {
+        color: "#52c41a",
+        bgColor: "#f6ffed",
+        borderColor: "#b7eb8f",
+        icon: <RiseOutlined />,
+        text: "买入信号",
+      },
+      sell: {
+        color: "#ff4d4f",
+        bgColor: "#fff2f0",
+        borderColor: "#ffccc7",
+        icon: <FallOutlined />,
+        text: "卖出信号",
+      },
+      hold: {
+        color: "#8c8c8c",
+        bgColor: "#fafafa",
+        borderColor: "#d9d9d9",
+        icon: <PauseOutlined />,
+        text: "持有观望",
+      },
+    };
+
+    const config = signalConfig[signal.signal_type] || signalConfig.hold;
+
+    return (
+      <Card
+        size="small"
+        style={{
+          marginBottom: 16,
+          backgroundColor: config.bgColor,
+          borderColor: config.borderColor,
+          borderWidth: 1,
+        }}
+      >
+        <Row gutter={16} align="middle">
+          <Col>
+            <div
+              style={{
+                width: 48,
+                height: 48,
+                borderRadius: "50%",
+                backgroundColor: config.color,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                color: "#fff",
+                fontSize: 20,
+              }}
+            >
+              {config.icon}
+            </div>
+          </Col>
+          <Col flex={1}>
+            <div
+              style={{
+                fontWeight: "bold",
+                color: config.color,
+                fontSize: 14,
+              }}
+            >
+              {config.text}
+              {signal.strength > 0 && (
+                <span style={{ marginLeft: 8, fontSize: 12, opacity: 0.8 }}>
+                  强度: {signal.strength}/5
+                </span>
+              )}
+            </div>
+            {signal.message && (
+              <div style={{ fontSize: 12, color: "#666", marginTop: 4 }}>
+                {signal.message}
+              </div>
+            )}
+          </Col>
+          {signal.signal_type !== "hold" && (
+            <Col>
+              <Row gutter={16}>
+                {signal.entry_price && (
+                  <Col style={{ textAlign: "center" }}>
+                    <div style={{ fontSize: 11, color: "#8c8c8c" }}>
+                      <AimOutlined /> 建议价位
+                    </div>
+                    <div style={{ fontWeight: "bold", color: config.color }}>
+                      ¥{signal.entry_price.toFixed(2)}
+                    </div>
+                  </Col>
+                )}
+                {signal.stop_loss && (
+                  <Col style={{ textAlign: "center" }}>
+                    <div style={{ fontSize: 11, color: "#8c8c8c" }}>
+                      <StopOutlined /> 止损价位
+                    </div>
+                    <div style={{ fontWeight: "bold", color: "#ff4d4f" }}>
+                      ¥{signal.stop_loss.toFixed(2)}
+                    </div>
+                  </Col>
+                )}
+                {signal.take_profit && (
+                  <Col style={{ textAlign: "center" }}>
+                    <div style={{ fontSize: 11, color: "#8c8c8c" }}>
+                      <TrophyOutlined /> 目标价位
+                    </div>
+                    <div style={{ fontWeight: "bold", color: "#52c41a" }}>
+                      ¥{signal.take_profit.toFixed(2)}
+                    </div>
+                  </Col>
+                )}
+              </Row>
+            </Col>
+          )}
+        </Row>
+        {signal.triggers?.length > 0 && (
+          <>
+            <Divider style={{ margin: "8px 0" }} />
+            <div>
+              <ThunderboltOutlined
+                style={{ marginRight: 4, color: "#faad14" }}
+              />
+              <Text type="secondary" style={{ fontSize: 11 }}>
+                触发条件: {signal.triggers.join("、")}
+              </Text>
+            </div>
+          </>
+        )}
+      </Card>
+    );
+  };
+
   // 估值详情内容
   const ValuationDetail = () => {
     if (valuationLoading) {
@@ -237,39 +440,87 @@ const StockChart = ({ symbol, name }) => {
       {
         title: "估值指标",
         items: [
-          { key: "pe_ratio", label: "PE (市盈率)", format: (v) => v?.toFixed(2) },
-          { key: "pb_ratio", label: "PB (市净率)", format: (v) => v?.toFixed(2) },
-          { key: "ps_ratio", label: "PS (市销率)", format: (v) => v?.toFixed(2) },
-          { key: "dividend_yield", label: "股息率", format: (v) => v != null ? `${(v * 100).toFixed(2)}%` : null },
+          {
+            key: "pe_ratio",
+            label: "PE (市盈率)",
+            format: (v) => v?.toFixed(2),
+          },
+          {
+            key: "pb_ratio",
+            label: "PB (市净率)",
+            format: (v) => v?.toFixed(2),
+          },
+          {
+            key: "ps_ratio",
+            label: "PS (市销率)",
+            format: (v) => v?.toFixed(2),
+          },
+          {
+            key: "dividend_yield",
+            label: "股息率",
+            format: (v) => (v != null ? `${(v * 100).toFixed(2)}%` : null),
+          },
         ],
       },
       {
         title: "盈利能力",
         items: [
-          { key: "roe", label: "ROE (净资产收益率)", format: (v) => v != null ? `${(v * 100).toFixed(2)}%` : null },
-          { key: "roa", label: "ROA (总资产收益率)", format: (v) => v != null ? `${(v * 100).toFixed(2)}%` : null },
-          { key: "profit_margin", label: "净利润率", format: (v) => v != null ? `${(v * 100).toFixed(2)}%` : null },
-          { key: "gross_margin", label: "毛利率", format: (v) => v != null ? `${(v * 100).toFixed(2)}%` : null },
+          {
+            key: "roe",
+            label: "ROE (净资产收益率)",
+            format: (v) => (v != null ? `${(v * 100).toFixed(2)}%` : null),
+          },
+          {
+            key: "roa",
+            label: "ROA (总资产收益率)",
+            format: (v) => (v != null ? `${(v * 100).toFixed(2)}%` : null),
+          },
+          {
+            key: "profit_margin",
+            label: "净利润率",
+            format: (v) => (v != null ? `${(v * 100).toFixed(2)}%` : null),
+          },
+          {
+            key: "gross_margin",
+            label: "毛利率",
+            format: (v) => (v != null ? `${(v * 100).toFixed(2)}%` : null),
+          },
         ],
       },
       {
         title: "成长能力",
         items: [
-          { key: "revenue_growth", label: "营收增长率", format: (v) => v != null ? `${(v * 100).toFixed(2)}%` : null },
+          {
+            key: "revenue_growth",
+            label: "营收增长率",
+            format: (v) => (v != null ? `${(v * 100).toFixed(2)}%` : null),
+          },
         ],
       },
       {
         title: "财务健康",
         items: [
-          { key: "debt_to_equity", label: "负债权益比", format: (v) => v?.toFixed(2) },
-          { key: "current_ratio", label: "流动比率", format: (v) => v?.toFixed(2) },
+          {
+            key: "debt_to_equity",
+            label: "负债权益比",
+            format: (v) => v?.toFixed(2),
+          },
+          {
+            key: "current_ratio",
+            label: "流动比率",
+            format: (v) => v?.toFixed(2),
+          },
         ],
       },
       {
         title: "每股指标",
         items: [
           { key: "eps", label: "EPS (每股收益)", format: (v) => v?.toFixed(2) },
-          { key: "book_value_per_share", label: "每股净资产", format: (v) => v?.toFixed(2) },
+          {
+            key: "book_value_per_share",
+            label: "每股净资产",
+            format: (v) => v?.toFixed(2),
+          },
         ],
       },
     ];
@@ -362,6 +613,9 @@ const StockChart = ({ symbol, name }) => {
 
         {/* 核心估值卡片 */}
         <ValuationCard />
+
+        {/* 买卖信号卡片 */}
+        <SignalCard />
 
         {/* 图表切换标签页 */}
         <Tabs

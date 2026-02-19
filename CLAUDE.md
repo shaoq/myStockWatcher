@@ -26,7 +26,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **前端**: React 18+, Vite (构建工具), Ant Design (UI 框架), Axios (HTTP 客户端)
 
 ### 核心功能
-基于移动平均线（MA）的股票价格预警系统，支持：
+智能股票分析系统，支持：
 - 股票信息管理（CRUD）
 - 实时价格查询（多数据源协调器：新浪→东方财富→腾讯→网易）
 - 多移动平均线指标监控（MA5, MA20 等，逗号分隔）
@@ -35,6 +35,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - 交易时间智能缓存（区分实时/缓存数据）
 - 每日报告生成与历史报告查看
 - 交易日历智能判断（多层数据源保障）
+- **技术指标计算**：MA、MACD、RSI、KDJ、布林带
+- **AI 交易信号**：基于技术指标自动生成买卖信号，含入场价/止损价/止盈价
+- **可配置交易规则**：用户自定义买卖规则，支持多种操作符和条件组合
 - 高级数据功能：
   - **A 股**（AKShare）：财报数据、估值指标（PE/PB）
   - **美股/全球**（OpenBB）：财报数据、估值指标、宏观经济指标（GDP/CPI/利率）
@@ -42,13 +45,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### 目录结构与核心逻辑
 - **`backend/app/`**:
     - `main.py`: FastAPI 应用入口，定义所有 RESTful API 路由
-    - `models.py`: 数据库模型（`Stock`, `Group`, `StockSnapshot`, `TradingCalendar`）
+    - `models.py`: 数据库模型（`Stock`, `Group`, `StockSnapshot`, `TradingCalendar`, `Signal`, `TradingRule`）
     - `schemas/`: Pydantic 模式目录
         - `__init__.py`: 基础模式
         - `advanced.py`: 高级数据模式（财报、估值、宏观）
     - `crud.py`: 封装底层数据库 CRUD 操作
     - `services/`: 业务逻辑层目录
         - `__init__.py`: 核心业务逻辑（交易日历、快照生成、报告计算、缓存）
+        - `indicators.py`: 技术指标计算（MA/MACD/RSI/KDJ/布林带）
+        - `signals.py`: 买卖信号生成服务
+        - `rule_engine.py`: 规则引擎（条件解析、价位计算、信号生成）
         - `advanced/`: 高级数据服务
             - `financial.py`: 财报服务
             - `valuation.py`: 估值服务
@@ -64,6 +70,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `components/StockList.jsx`: 核心股票管理界面
     - `components/DailyReport.jsx`: 每日报告页面（简化版，支持点击查看趋势图）
     - `components/StockChart.jsx`: 股票趋势图组件（分时图、日K、周K、月K）
+    - `components/TradingRules.jsx`: 交易规则配置页面（买入/卖出规则管理）
+    - `components/RuleEditor.jsx`: 规则编辑器（可视化配置条件和价位）
     - `services/api.js`: Axios 客户端封装，统一处理后端请求
     - `App.jsx`: 应用主布局与 Ant Design 全局主题配置
 
@@ -80,10 +88,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `POST /stocks/symbol/{symbol}/update-price` - 刷新指定股票价格
 - `POST /stocks/update-all-prices` - 批量刷新所有股票价格
 - `GET /stocks/symbol/{symbol}/charts` - 获取股票趋势图 URL
+- `GET /stocks/symbol/{symbol}/signal` - 获取股票交易信号（买入/卖出/持有）
 - 分组管理端点：`/groups/` 系列接口
 - 交易日历端点：`/trading-calendar/check`, `/trading-calendar/refresh`
 - 快照管理端点：`/snapshots/generate`, `/snapshots/check-today`, `/snapshots/dates`
 - 每日报告端点：`/reports/daily`（支持分页）
+- 交易规则端点：
+  - `GET /rules/` - 获取所有规则
+  - `POST /rules/` - 创建规则
+  - `PUT /rules/{rule_id}` - 更新规则
+  - `DELETE /rules/{rule_id}` - 删除规则
+  - `POST /rules/recalculate-signals` - 批量重算所有股票信号
 - 高级数据端点（多数据源）：
   - `GET /stocks/{symbol}/financial/report` - 获取财报数据（A股: AKShare, 美股: OpenBB）
   - `GET /stocks/{symbol}/valuation` - 获取估值指标（A股: AKShare, 美股: OpenBB）
@@ -234,6 +249,40 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `is_trading_day`: 是否为交易日 (0/1)
 - `year`: 年份（用于批量查询缓存）
 
+### 交易日判断规则（重要）
+
+**禁止自行编写仅判断周末的交易日逻辑！**
+
+项目中所有交易日/交易时间判断必须使用以下统一函数：
+
+| 函数 | 位置 | 用途 |
+|------|------|------|
+| `is_trading_day(db, target_date)` | `services/__init__.py` | 判断指定日期是否为交易日（含节假日） |
+| `is_real_trading_time(market, db)` | `services/__init__.py` | 判断当前是否为真正的交易时间（交易日+交易时间段） |
+| `_is_trading_day_with_cache(now)` | `providers/spot_cache.py` | 带缓存的交易日判断（内部调用 `is_trading_day`） |
+
+**正确示例**：
+```python
+# 判断今天是否为交易日
+is_trading, reason = is_trading_day(db, date.today())
+
+# 判断当前是否在交易时间（含节假日判断）
+if is_real_trading_time("cn", db=db):
+    # 交易时间内逻辑
+    pass
+```
+
+**错误示例**（禁止）：
+```python
+# ❌ 仅判断周末，忽略了节假日
+if now.weekday() < 5:
+    return True
+
+# ❌ 自行编写交易日判断
+def is_trading_day_simple():
+    return datetime.now().weekday() < 5
+```
+
 ## 多数据源架构
 
 ### 数据源协调器
@@ -318,4 +367,153 @@ OpenBB 使用 Yahoo Finance 格式，系统自动转换：
 **错误处理**：
 - OpenBB/AKShare 未安装时，高级数据端点返回 503 错误
 - 数据获取失败时，返回详细错误信息
+
+## 技术指标计算
+
+### 支持的指标
+
+| 指标 | 说明 | 关键参数 |
+|------|------|---------|
+| **MA** | 移动平均线 | MA5, MA10, MA20, MA60 |
+| **MACD** | 指数平滑异同移动平均线 | DIF, DEA, MACD柱 |
+| **RSI** | 相对强弱指标 | 周期14，超卖<30，超买>70 |
+| **KDJ** | 随机指标 | K, D, J 值 |
+| **Bollinger** | 布林带 | 上轨、中轨、下轨 |
+
+### 后端实现 (`services/indicators.py`)
+
+**核心函数**：
+- `calc_ma(df, periods)`: 计算移动平均线，检测金叉/死叉
+- `calc_macd(df, fast, slow, signal)`: 计算 MACD，检测金叉/死叉
+- `calc_rsi(df, period)`: 计算 RSI，判断超买超卖
+- `calc_kdj(df, n, m1, m2)`: 计算 KDJ，检测金叉/死叉
+- `calc_bollinger(df, period, std_dev)`: 计算布林带，检测突破信号
+- `calc_all_indicators(df)`: 一次性计算所有指标
+
+**信号类型**：
+- `golden_cross`: 金叉（买入信号）
+- `dead_cross`: 死叉（卖出信号）
+- `oversold`: 超卖（RSI < 30）
+- `overbought`: 超买（RSI > 70）
+- `below_lower`: 跌破布林下轨
+- `above_upper`: 突破布林上轨
+
+## 交易信号生成
+
+### 信号类型
+
+| 类型 | 说明 |
+|------|------|
+| `buy` | 买入信号 |
+| `sell` | 卖出信号 |
+| `hold` | 持有（无明显信号） |
+
+### 后端实现 (`services/signals.py`)
+
+**核心函数**：
+- `generate_signal(df, current_price, rules)`: 生成综合信号
+- `generate_signal_with_db(df, db, current_price)`: 使用数据库规则生成信号
+- `detect_buy_signals(indicators, current_price)`: 检测买入信号（硬编码 fallback）
+- `detect_sell_signals(indicators, current_price)`: 检测卖出信号（硬编码 fallback）
+
+**信号结构**：
+```json
+{
+  "signal_type": "buy",
+  "strength": 3,
+  "entry_price": 100.00,
+  "stop_loss": 95.00,
+  "take_profit": 108.00,
+  "triggers": ["MA金叉", "RSI超卖"],
+  "indicators": {"MA": {"MA5": 102, "MA20": 100}, ...},
+  "message": "MA5上穿MA20，建议在MA20附近100.00买入"
+}
+```
+
+## 可配置交易规则
+
+### 功能概述
+
+用户可自定义买卖规则，支持：
+- 多种技术指标作为触发条件
+- 灵活的条件组合（AND 逻辑）
+- 可配置的入场价、止损价、止盈价
+- 规则优先级和信号强度
+
+### 数据库模型 (`TradingRule`)
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `name` | String | 规则名称 |
+| `rule_type` | String | 规则类型：buy/sell |
+| `enabled` | Boolean | 是否启用 |
+| `priority` | Integer | 优先级（越大越优先） |
+| `strength` | Integer | 信号强度 1-5 |
+| `conditions` | JSON | 触发条件配置 |
+| `price_config` | JSON | 价位配置 |
+
+### 后端实现 (`services/rule_engine.py`)
+
+**核心类**：
+- `ConditionParser`: 条件解析器，支持多种操作符
+- `PriceCalculator`: 价位计算器
+- `RuleEngine`: 规则引擎，评估规则并生成信号
+
+**支持的操作符**：
+
+| 类别 | 操作符 | 说明 |
+|------|--------|------|
+| 比较 | gt, lt, gte, lte, eq | 大于、小于、大于等于、小于等于、等于 |
+| 交叉 | cross_above, cross_below | 上穿、下穿（需历史数据） |
+| 阈值 | below_threshold, above_threshold | 低于阈值、高于阈值 |
+
+**条件配置示例**：
+```json
+{
+  "indicator": "MA",
+  "field": "MA5",
+  "operator": "cross_above",
+  "target_type": "indicator",
+  "target_indicator": "MA",
+  "target_field": "MA20"
+}
+```
+
+**价位配置示例**：
+```json
+{
+  "entry": {"type": "indicator", "indicator": "MA", "field": "MA20"},
+  "stop_loss": {"type": "percentage", "base": "entry", "value": -0.05},
+  "take_profit": {"type": "percentage", "base": "entry", "value": 0.08}
+}
+```
+
+### 默认规则（8条）
+
+系统内置 8 条默认规则（4 买 4 卖）：
+
+| 规则名称 | 类型 | 触发条件 | 强度 |
+|---------|------|---------|------|
+| MA金叉买入 | buy | MA5 上穿 MA20 | 3 |
+| RSI超卖买入 | buy | RSI < 30 | 2 |
+| 布林下轨买入 | buy | 价格跌破布林下轨 | 3 |
+| MACD金叉买入 | buy | DIF 上穿 DEA | 2 |
+| MA死叉卖出 | sell | MA5 下穿 MA20 | 3 |
+| RSI超买卖出 | sell | RSI > 70 | 2 |
+| 布林上轨卖出 | sell | 价格突破布林上轨 | 3 |
+| MACD死叉卖出 | sell | DIF 下穿 DEA | 2 |
+
+### 前端实现 (`TradingRules.jsx`, `RuleEditor.jsx`)
+
+**TradingRules 组件**：
+- 按买入/卖出分组展示规则列表
+- 支持启用/禁用规则开关
+- 支持编辑/删除规则
+- 批量重算信号按钮
+
+**RuleEditor 组件**：
+- 可视化规则编辑表单
+- 支持添加/删除多个条件
+- 支持配置入场价、止损价、止盈价
+- 表单验证和预览
 

@@ -6,10 +6,11 @@
 """
 
 import logging
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Set
 from datetime import datetime
 
 from .base import DataProvider, StockData
+from .spot_cache import get_spot_data_with_cache
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +20,7 @@ class EastMoneyProvider(DataProvider):
 
     PRIORITY = 2
     NAME = "eastmoney"
-    CAPABILITIES = {"realtime_price", "kline_data"}
+    CAPABILITIES: Set[str] = {"realtime_price", "kline_data", "valuation_metrics"}
 
     def _get_akshare(self):
         """延迟导入 AKShare，避免未安装时报错"""
@@ -46,9 +47,16 @@ class EastMoneyProvider(DataProvider):
             return None
 
         try:
-            # 使用新浪实时行情（AKShare 封装）
-            # 注意: normalized_code 格式为 "sh600000" 或 "sz000001"
-            df = ak.stock_zh_a_spot_em()
+            # 使用缓存获取全量数据
+            df = get_spot_data_with_cache(
+                fetch_func=lambda: ak.stock_zh_a_spot_em(),
+                source=self.NAME
+            )
+
+            if df is None:
+                logger.warning(f"[东方财富] 全量数据获取失败 | 股票: {symbol}")
+                self.record_failure()
+                return None
 
             # 解析代码，去掉市场前缀
             code = normalized_code[2:] if len(normalized_code) > 2 else normalized_code
@@ -86,6 +94,100 @@ class EastMoneyProvider(DataProvider):
         except Exception as e:
             logger.error(f"[东方财富] 获取实时价格异常 | 股票: {symbol} | 错误: {type(e).__name__}: {e}")
             self.record_failure()
+            return None
+
+    def get_valuation_metrics(self, symbol: str, normalized_code: str, market: str) -> Optional[Dict]:
+        """
+        获取估值指标
+
+        使用缓存的全量数据提取估值指标
+
+        Args:
+            symbol: 原始股票代码
+            normalized_code: 规范化后的代码
+            market: 市场类型
+
+        Returns:
+            估值指标字典
+        """
+        if market != "cn":
+            logger.debug(f"[东方财富] 不支持美股估值 | 股票: {symbol}")
+            return None
+
+        ak = self._get_akshare()
+        if ak is None:
+            return None
+
+        try:
+            logger.info(f"[东方财富] 获取估值指标 | 股票: {symbol}")
+
+            # 使用缓存获取全量数据
+            df = get_spot_data_with_cache(
+                fetch_func=lambda: ak.stock_zh_a_spot_em(),
+                source=self.NAME
+            )
+
+            if df is None:
+                logger.warning(f"[东方财富] 全量数据获取失败 | 股票: {symbol}")
+                return None
+
+            # 解析代码，去掉市场前缀
+            code = normalized_code[2:] if len(normalized_code) > 2 else normalized_code
+
+            # 查找对应股票
+            row = df[df['代码'] == code]
+            if row.empty:
+                logger.warning(f"[东方财富] 未找到估值数据 | 股票: {symbol}")
+                return None
+
+            latest = row.iloc[0]
+
+            # 构建估值指标
+            result = {
+                "pe_ratio": self._parse_value(latest.get("市盈率-动态")),
+                "pb_ratio": self._parse_value(latest.get("市净率")),
+                "ps_ratio": None,
+                "roe": None,
+                "roa": None,
+                "revenue_growth": None,
+                "profit_margin": None,
+                "gross_margin": None,
+                "debt_to_equity": None,
+                "current_ratio": None,
+                "dividend_yield": None,
+                "eps": None,
+                "book_value_per_share": None,
+                "market_cap": self._parse_value(latest.get("总市值")),
+                "circulating_market_cap": self._parse_value(latest.get("流通市值")),
+            }
+
+            logger.info(f"[东方财富] 估值获取成功 | 股票: {symbol} | PE: {result['pe_ratio']} | PB: {result['pb_ratio']}")
+            return result
+
+        except Exception as e:
+            logger.error(f"[东方财富] 估值指标获取异常 | 股票: {symbol} | 错误: {e}")
+            return None
+
+    def _parse_value(self, value) -> Optional[float]:
+        """解析数值，处理各种格式"""
+        if value is None:
+            return None
+        try:
+            if isinstance(value, (int, float)):
+                return float(value)
+            s = str(value).strip()
+            if not s or s == "-" or s == "--" or s.lower() == "nan":
+                return None
+            s = s.replace(",", "")
+            multiplier = 1
+            if "亿" in s:
+                multiplier = 1e8
+                s = s.replace("亿", "")
+            elif "万" in s:
+                multiplier = 1e4
+                s = s.replace("万", "")
+            return float(s) * multiplier
+        except (ValueError, TypeError):
             return None
 
     def get_kline_data(self, symbol: str, normalized_code: str, market: str,

@@ -13,6 +13,7 @@ from datetime import datetime
 from threading import Lock
 
 from .base import DataProvider, StockData
+from .spot_cache import get_spot_data_with_cache
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +180,8 @@ class AKShareProvider(DataProvider):
         """
         获取估值指标
 
+        使用共享缓存获取全量数据，避免重复下载
+
         Args:
             symbol: 原始股票代码
             normalized_code: 规范化后的代码
@@ -193,16 +196,20 @@ class AKShareProvider(DataProvider):
         try:
             logger.info(f"[AKShare] 获取估值指标 | 股票: {symbol}")
 
-            # 获取实时行情数据（包含 PE、PB）
-            try:
-                df = self.ak.stock_zh_a_spot_em()
-                # 查找对应股票
-                row = df[df['代码'] == normalized_code]
-                if row.empty:
-                    row = df[df['代码'] == symbol]
-            except Exception as e:
-                logger.warning(f"[AKShare] 实时数据获取失败: {e}")
+            # 使用缓存获取全量数据
+            df = get_spot_data_with_cache(
+                fetch_func=lambda: self.ak.stock_zh_a_spot_em(),
+                source="akshare"
+            )
+
+            if df is None:
+                logger.warning(f"[AKShare] 全量数据获取失败 | 股票: {symbol}")
                 return None
+
+            # 查找对应股票
+            row = df[df['代码'] == normalized_code]
+            if row.empty:
+                row = df[df['代码'] == symbol]
 
             if row.empty:
                 logger.warning(f"[AKShare] 未找到股票估值数据 | 股票: {symbol}")

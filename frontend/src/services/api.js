@@ -221,6 +221,16 @@ export const stockApi = {
     return response.data;
   },
 
+  // --- 估值数据 ---
+
+  // 获取股票估值指标
+  getValuation: async (symbol, useCache = true) => {
+    const response = await apiClient.get(`/stocks/${symbol}/valuation`, {
+      params: { use_cache: useCache },
+    });
+    return response.data;
+  },
+
   // --- 每日报告 ---
 
   // 获取每日报告（支持指定日期和分页）

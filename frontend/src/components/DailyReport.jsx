@@ -908,7 +908,7 @@ const DailyReport = () => {
           setSelectedSymbol(null);
         }}
         footer={null}
-        width={650}
+        width={750}
         centered
         destroyOnClose
       >
